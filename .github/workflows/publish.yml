@@ -1,0 +1,41 @@
+name: publish
+# Publishes packages/cli to npm as @briq-cloud/cli when a release tag (v0.1.0) is pushed. npm
+# Trusted Publishing: no token, the registry trusts this workflow of this repo, and signs the
+# package's provenance with this run's identity.
+on:
+  push:
+    tags: ["v*"]
+
+permissions: { contents: read, id-token: write }
+
+jobs:
+  publish:
+    # GitHub's own runners: free for a public repo. (up-lab/briq runs on Ubicloud; this repo is not
+    # in that org.)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version-file: .node-version, cache: pnpm, registry-url: "https://registry.npmjs.org" }
+      # Trusted Publishing needs npm 11.5.1 or later.
+      - run: npm install -g npm@^11.5.1
+      - run: pnpm install --frozen-lockfile
+      - name: The tag is the package's version
+        run: |
+          set -euo pipefail
+          have=$(node -p "require('./packages/cli/package.json').version")
+          test "v$have" = "$GITHUB_REF_NAME" || { echo "::error::tag $GITHUB_REF_NAME, package $have"; exit 1; }
+      - run: pnpm build
+      - run: pnpm test
+      - name: Pack, install and run
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pack"
+          (cd packages/cli && pnpm pack --pack-destination "$RUNNER_TEMP/pack")
+          cd "$(mktemp -d)" && npm init -y >/dev/null
+          npm install "$RUNNER_TEMP"/pack/briq-cloud-cli-*.tgz
+          npx briq --version
+          set +e; BRIQ_CONFIG_DIR="$(mktemp -d)" npx briq whoami; code=$?; set -e
+          test "$code" = 3
+      - run: npm publish "$RUNNER_TEMP"/pack/briq-cloud-cli-*.tgz --access public --provenance

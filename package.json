@@ -1,0 +1,19 @@
+{
+  "name": "briq-cli-source",
+  "private": true,
+  "version": "0.0.0",
+  "description": "The source of @briq-cloud/cli, as published to npm.",
+  "packageManager": "pnpm@9.7.0",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "typescript": "^5.6.3"
+  }
+}
