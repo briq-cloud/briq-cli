@@ -1,46 +1,15 @@
 # @briq-cloud/cli
 
-The command line for [briq](https://briq.cloud). Run Postgres, Redis or any Docker image on a cloud
-microVM. Fork a whole stack, data included, for each git branch.
+The command line for [briq](https://briq.cloud): run Postgres, Redis or any Docker image on a cloud
+microVM, from a terminal, a script or a git hook.
+
+## Install
+
+Install it with npm. It needs Node 22.6 or later.
 
 ```bash
 npm install -g @briq-cloud/cli
-briq login
-briq run postgres --sleep 2h
 ```
-
-`briq run` prints the connection string (`DATABASE_URL=postgres://…`). The database sleeps after
-two hours without use and wakes on the next call, with its data.
-
-Needs Node 22.6 or later.
-
-## A database per git branch
-
-Declare the stack in `briq.yaml`, at the root of the repo:
-
-```yaml
-stack: shop
-services:
-  db: { recipe: postgres }
-  cache: { recipe: redis }
-```
-
-Then:
-
-```bash
-briq up --env .env
-briq fork --stack shop --branch feat/login --env .env.local --expose
-briq destroy --branch feat/login
-```
-
-1. `briq up` creates the services the stack does not have, and writes their connection strings
-   to `.env`.
-2. `briq fork` copies every service of `shop`, disks included, into the stack `feat-login`.
-   `--expose` gives each database a TLS endpoint, so this machine reaches the copy through
-   `.env.local`.
-3. `briq destroy --branch` removes the copy once the branch is merged.
-
-To run it from git hooks: [A database per branch](https://briq.cloud/docs/guides/database-per-branch).
 
 ## Sign in
 
@@ -52,6 +21,18 @@ To run it from git hooks: [A database per branch](https://briq.cloud/docs/guides
 
 `briq whoami` shows the team, the credential and its budget. `briq logout` forgets the sign-in on
 this machine. Revoke it on the dashboard's Agents page.
+
+## Run a service
+
+`briq run` creates a briq from a recipe or an image. This one is a Postgres database:
+
+```bash
+briq run postgres --sleep 2h
+```
+
+It prints the briq, its connection strings (`DATABASE_URL`, `PGHOST`…) and what it has cost so
+far. The database sleeps after two hours without use, and wakes on the next call with its data.
+`briq catalog` lists the recipes.
 
 ## Commands
 
@@ -96,8 +77,44 @@ is `briq_exec`. Every option is in the [CLI reference](https://briq.cloud/docs/c
 
 `briq exec` and `briq exec-result` exit with the command's own code.
 
+## Guide: a database per git branch
+
+Each branch gets its own copy of the stack, data included.
+
+1. Declare the stack in `briq.yaml`, at the root of the repo:
+
+   ```yaml
+   stack: shop
+   services:
+     db: { recipe: postgres }
+     cache: { recipe: redis }
+   ```
+
+2. Create the stack. Its connection strings go to `.env`:
+
+   ```bash
+   briq up --env .env
+   ```
+
+3. Fork it for a branch. Every service is copied, disks included, into the stack `feat-login`.
+   `--expose` gives each database a TLS endpoint, which `.env.local` points at:
+
+   ```bash
+   briq fork --stack shop --branch feat/login --env .env.local --expose
+   ```
+
+4. Remove the copy once the branch is merged:
+
+   ```bash
+   briq destroy --branch feat/login
+   ```
+
+To run these from git hooks, see [A database per branch](https://briq.cloud/docs/guides/database-per-branch).
+
 ## Links
 
-- [Docs](https://briq.cloud/docs) · [CLI reference](https://briq.cloud/docs/cli) · [Stack file](https://briq.cloud/docs/stack-file)
+- [Docs](https://briq.cloud/docs)
+- [CLI reference](https://briq.cloud/docs/cli)
+- [Stack file](https://briq.cloud/docs/stack-file)
 - Help: [hello@briq.cloud](mailto:hello@briq.cloud)
 - Licence: MIT
