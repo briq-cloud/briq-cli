@@ -1,7 +1,7 @@
 # @briq-cloud/cli
 
-The command line for [briq](https://briq.cloud): run Postgres, Redis or any Docker image on a cloud
-microVM, from a terminal, a script or a git hook.
+The command line for [briq](https://briq.cloud): run Postgres, Redis, a sandbox or any Docker image
+on a cloud microVM, from a terminal, a script or a git hook.
 
 ## Install
 
