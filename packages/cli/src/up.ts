@@ -84,6 +84,7 @@ export function registerUp(program: Command, deps: UpDeps) {
       'the value of a { secret: NAME } of the file; NAME alone reads it from the environment',
     )
     .option('--env <file>', 'write the outputs into this dotenv file')
+    .option('--expose', 'outputs this machine can use: databases get TLS endpoints')
     .option('--no-wait', 'return before the new briqs are ready')
     .action(
       async (o: {
@@ -91,6 +92,7 @@ export function registerUp(program: Command, deps: UpDeps) {
         stack?: string;
         secret?: string[];
         env?: string;
+        expose?: boolean;
         wait: boolean;
       }) => {
         try {
@@ -102,13 +104,16 @@ export function registerUp(program: Command, deps: UpDeps) {
           const text = readFileSync(path, 'utf8');
           const secrets = secretValues(o.secret);
           // Outputs name the new briqs' hosts once they have machines: an env file needs the wait.
-          if (o.env && !o.wait)
-            return deps.fail(usage('--env needs the briqs ready: leave out --no-wait'));
+          if ((o.env || o.expose) && !o.wait)
+            return deps.fail(
+              usage(`${o.env ? '--env' : '--expose'} needs the briqs ready: leave out --no-wait`),
+            );
           const wait = o.wait;
           const r = await (await deps.client()).up({
             file: text,
             ...(o.stack ? { stack: o.stack } : {}),
             ...(Object.keys(secrets).length ? { secrets } : {}),
+            ...(o.expose ? { expose: true } : {}),
             wait,
             waitTimeoutMs: 300_000,
           });

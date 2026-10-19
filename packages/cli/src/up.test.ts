@@ -102,6 +102,31 @@ describe('briq up', () => {
     const fresh = join(dir, '.env.new');
     await program.parseAsync(['up', '-f', file, '--env', fresh], { from: 'user' });
     expect(statSync(fresh).mode & 0o777).toBe(0o600);
+
+    // --expose asks for outputs this machine can use, and needs the wait
+    const fresh2 = () => {
+      const p = new Command('briq').exitOverride();
+      registerUp(p, {
+        client: async () =>
+          ({
+            up: async (input: StackUpInput) => {
+              sent.push(input);
+              return result;
+            },
+          }) as unknown as BriqClient,
+        out: () => undefined,
+        fail: (e) => {
+          throw e;
+        },
+        fmtBriq: (b) => b.id,
+      });
+      return p;
+    };
+    await fresh2().parseAsync(['up', '-f', file, '--expose'], { from: 'user' });
+    expect(sent.at(-1)).toEqual({ file: FILE, expose: true, wait: true, waitTimeoutMs: 300_000 });
+    await expect(
+      fresh2().parseAsync(['up', '-f', file, '--expose', '--no-wait'], { from: 'user' }),
+    ).rejects.toThrow(/--expose needs the briqs ready/);
     Reflect.deleteProperty(process.env, 'STRIPE_KEY');
     Reflect.deleteProperty(process.env, 'OTHER');
   });

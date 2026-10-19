@@ -1,6 +1,6 @@
 {
   "name": "@briq-cloud/cli",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "The briq command line: run databases, sandboxes and any OCI image for your agents, fork a stack per git branch.",
   "keywords": [
     "briq",

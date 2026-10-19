@@ -37,6 +37,8 @@ export interface StackUpInput {
   stack?: string;
   /** Values of secrets the file names as `{ secret: NAME }`, by name; the others are generated. */
   secrets?: Record<string, string>;
+  /** Outputs a client outside briq uses: databases get TLS endpoints. Waits for the briqs. */
+  expose?: boolean;
   wait?: boolean;
   waitTimeoutMs?: number;
 }

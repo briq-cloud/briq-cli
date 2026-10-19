@@ -90,10 +90,11 @@ Each branch gets its own copy of the stack, data included.
      cache: { recipe: redis }
    ```
 
-2. Create the stack. Its connection strings go to `.env`:
+2. Create the stack. `--expose` gives each database a TLS endpoint, and `.env` gets connection
+   strings that this machine can use:
 
    ```bash
-   briq up --env .env
+   briq up --env .env --expose
    ```
 
 3. Fork it for a branch. Every service is copied, disks included, into the stack `feat-login`.
