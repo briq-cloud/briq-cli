@@ -3,6 +3,7 @@ export * from './money.js';
 export * from './plans.js';
 export * from './policy.js';
 export * from './refs.js';
+export * from './secrets.js';
 export * from './sizes.js';
 export * from './sleep.js';
 export * from './slug.js';

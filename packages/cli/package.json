@@ -1,6 +1,6 @@
 {
   "name": "@briq-cloud/cli",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "The briq command line: run databases, sandboxes and any OCI image for your agents, fork a stack per git branch.",
   "keywords": [
     "briq",
@@ -45,11 +45,13 @@
   "dependencies": {
     "commander": "^12.1.0",
     "picocolors": "^1.1.1",
+    "ws": "^8.18.3",
     "zod": "^3.25.0"
   },
   "devDependencies": {
     "@briq/public": "workspace:*",
     "@briq/sdk": "workspace:*",
+    "@types/ws": "^8.18.1",
     "esbuild": "0.25.12",
     "tsx": "^4.19.1",
     "vitest": "^2.1.3"

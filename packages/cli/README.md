@@ -45,7 +45,7 @@ far. The database sleeps after two hours without use, and wakes on the next call
 | `briq status <briq>` | Show one briq |
 | `briq logs <briq>` | Show its recent logs |
 | `briq exec <briq> <cmd…>` | Run a command in it, and exit with its code. `--async` for a long one |
-| `briq files-put <briq> <path> [file]` | Upload a file, 1 MB at most |
+| `briq files-put <briq> <path> [file]` | Upload a file, sent as it is read; the limit is `maxFileBytes` in `briq quota --json` |
 | `briq files-get <briq> <path>` | Download a file |
 | `briq expose <briq> <port>` | Give a port a URL. `--protocol postgres` for a TCP endpoint over TLS |
 | `briq fork [briq]` | Fork a briq, or every briq of a stack with `--stack` |
@@ -54,6 +54,7 @@ far. The database sleeps after two hours without use, and wakes on the next call
 | `briq destroy [briq]` | Destroy a briq, or a whole stack with `--stack` or `--branch` |
 | `briq set-sleep <briq> <sleep>` | Set when it sleeps: `30m`, `3h`, `7d` or `never` |
 | `briq quota` | Show what the credential may still spend and run today |
+| `briq secrets` | The team's secrets: names and hosts, never a value |
 | `briq feedback <topic> <message>` | Write to the briq team: `bug`, `idea` or `question` |
 
 A `<briq>` is an id, such as `bq_7kq2m9x1p4ab`. `--json` on any command prints the API's response.
@@ -110,7 +111,7 @@ Each branch gets its own copy of the stack, data included.
    briq destroy --branch feat/login
    ```
 
-To run these from git hooks, see [A database per branch](https://briq.cloud/docs/guides/database-per-branch).
+To run these from git hooks, see [Give each Claude Code worktree its own database](https://briq.cloud/docs/guides/claude-code-worktree-database).
 
 ## Links
 

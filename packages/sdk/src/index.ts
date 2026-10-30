@@ -6,7 +6,11 @@ import type {
   ForkCopy,
   KeyPolicy,
   RecipeFields,
+  Size,
   SupportTopic,
+  TeamSecretIn,
+  TeamSecretOut,
+  TeamSecretUpdate,
 } from '@briq/public';
 
 export type { BriqRecord, BriqSpecInput, ForkCopy, KeyPolicy, RecipeFields };
@@ -77,8 +81,34 @@ export interface Exec {
   outputDir: string;
   /** False when the briq is not running: `state` is the last one seen, `output` is absent. */
   briqRunning: boolean;
-  /** The last 64 KB of each stream and their whole sizes; absent when the briq is not running. */
+  /**
+   * The last 64 KB of each stream and their whole sizes; absent when the briq is not running, and
+   * when read from an offset (`read` instead).
+   */
   output?: { stdout: string; stderr: string; stdoutBytes: number; stderrBytes: number };
+  /** With `offset`: one stream from that byte offset. Follow `nextOffset` until `eof`. */
+  read?: ExecRead;
+  /** Its standard input, when started with `stdinOpen`: open until an `eof`, and the last `seq` taken. */
+  input?: { open: boolean; seq: number };
+}
+/** One stream of an async exec from a byte offset. */
+export interface ExecRead {
+  stream: 'stdout' | 'stderr';
+  /** Where `data` starts, in bytes. */
+  offset: number;
+  /** Up to 256 KB from `offset`, cut at a whole UTF-8 character. */
+  data: string;
+  /** The offset to read from next. */
+  nextOffset: number;
+  /** The stream's whole size so far, in bytes. */
+  bytes: number;
+  /** The command ended and `data` reaches the end of the stream: nothing more will come. */
+  eof: boolean;
+}
+/** A command's own environment: `env` over the briq's, or with `clearEnv` over its PATH, HOME and LANG only. */
+export interface ExecEnvOptions {
+  env?: Record<string, string>;
+  clearEnv?: boolean;
 }
 export interface ExecResult {
   stdout: string;
@@ -110,6 +140,8 @@ export interface Quota {
   /** Volume GB the team holds, stopped and failed briqs included, and its plan's most; absent from an older API. */
   diskGb?: number;
   maxDiskGb?: number;
+  /** The largest file `putFileBytes` writes and `getFileBytes` reads; `putFile` and `getFile` carry 1 MB whatever this is. Absent from an older API. */
+  maxFileBytes?: number;
   /** The team the call acts on; absent from an older API. */
   team?: { id: string; slug: string; name: string };
   /** The key or connected client (`oauth`) the call presents; null from a dashboard session. */
@@ -183,13 +215,36 @@ export class BriqApiError extends Error {
     readonly details?: unknown,
     /** The API's id for the failed request (`x-request-id`): quote it when asking for help. */
     readonly requestId?: string,
+    /** The answer is a stored one, sent again for a repeated `Idempotency-Key`: sending it again gives the same. */
+    readonly replayed = false,
   ) {
     super(message);
   }
 }
 
+/** What a call that creates briqs takes beside its input. */
+export interface CreateOptions {
+  /**
+   * The call's `Idempotency-Key`. By default a new random one for each call, kept across the
+   * client's own retries: a call that is sent twice makes its briqs once. Pass your own to repeat a
+   * call later, for example after a restart.
+   *
+   * A key repeats the first answer for 24 hours, even if the briq has since been destroyed or
+   * changed, and a call that did not wait (`wait: false`) repeats its `creating` snapshot. An
+   * error from the server (5xx) is repeated too, so a call that may have been made only in part is
+   * never made again: use a new key to start over.
+   */
+  idempotencyKey?: string;
+}
+
+/** The attempts a creating call makes in all, and the pause before each retry (doubled each time). */
+const CREATE_ATTEMPTS = 3;
+const RETRY_PAUSE_MS = 500;
+
 export interface BriqClientOptions {
   baseUrl?: string;
+  /** The pause before a creating call's first retry; 500 ms by default. */
+  retryPauseMs?: number;
   /** Custom fetch, e.g. an in-process Hono `app.request` for tests or the hosted MCP server. */
   fetch?: typeof fetch;
 }
@@ -198,12 +253,94 @@ export interface BriqClientOptions {
 export class Briq {
   private readonly baseUrl: string;
   private readonly f: typeof fetch;
+  private readonly retryPauseMs: number;
   constructor(
     private readonly apiKey: string,
     opts: BriqClientOptions = {},
   ) {
     this.baseUrl = (opts.baseUrl ?? 'https://api.briq.cloud').replace(/\/$/, '');
     this.f = opts.fetch ?? fetch;
+    this.retryPauseMs = opts.retryPauseMs ?? RETRY_PAUSE_MS;
+  }
+
+  /**
+   * A call that creates briqs: sent with an `Idempotency-Key`, and sent again with the same key
+   * when no answer came (the connection dropped or timed out, a 502, 503 or 504) or the first
+   * request with the key was still running. Asked twice, the API makes the briqs once.
+   */
+  private async create<T>(path: string, body: unknown, opts: CreateOptions = {}): Promise<T> {
+    const key = opts.idempotencyKey ?? crypto.randomUUID();
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.call<T>('POST', path, body, undefined, key);
+      } catch (err) {
+        const again =
+          err instanceof BriqApiError
+            ? !err.replayed &&
+              (([502, 503, 504].includes(err.status) && err.code !== 'provider_error') ||
+                err.status === 503 ||
+                err.code === 'idempotency_in_progress')
+            : true; // no answer at all: fetch threw
+        if (!again || attempt >= CREATE_ATTEMPTS) throw err;
+        await new Promise((r) => setTimeout(r, this.retryPauseMs * 2 ** (attempt - 1)));
+      }
+    }
+  }
+
+  /** The API's refusal as an error: its code, message, details and the request's id. */
+  private failure(res: Response, json: Record<string, unknown>) {
+    const e =
+      (
+        json as {
+          error?: { code?: string; message?: string; details?: unknown; requestId?: string };
+        }
+      ).error ?? {};
+    return new BriqApiError(
+      res.status,
+      e.code ?? 'error',
+      e.message ?? `HTTP ${res.status}`,
+      e.details,
+      res.headers.get('x-request-id') ?? e.requestId ?? undefined,
+      res.headers.get('idempotent-replayed') === 'true',
+    );
+  }
+
+  /**
+   * A request whose body or answer is raw bytes (a file): the answer is returned unread, so a
+   * large file is not held whole. A refusal is read as `call` reads it.
+   */
+  private async bytes(
+    method: string,
+    path: string,
+    query: Record<string, string>,
+    body?: Uint8Array | Blob | ReadableStream<Uint8Array>,
+  ): Promise<Response> {
+    const res = await this.f(`${this.baseUrl}${path}?${new URLSearchParams(query)}`, {
+      method,
+      headers: {
+        authorization: `Bearer ${this.apiKey}`,
+        ...(body === undefined ? {} : { 'content-type': 'application/octet-stream' }),
+        accept: body === undefined ? 'application/octet-stream' : 'application/json',
+      },
+      ...(body === undefined ? {} : { body }),
+      // A stream is sent as it is read; fetch wants to be told it is one-way.
+      ...(body instanceof ReadableStream ? { duplex: 'half' } : {}),
+    } as RequestInit);
+    if (res.ok) return res;
+    const text = await res.text();
+    let json: Record<string, unknown> = {};
+    try {
+      if (text) json = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      throw new BriqApiError(
+        res.status,
+        'error',
+        `HTTP ${res.status}`,
+        undefined,
+        res.headers.get('x-request-id') ?? undefined,
+      );
+    }
+    throw this.failure(res, json);
   }
 
   private async call<T>(
@@ -211,6 +348,7 @@ export class Briq {
     path: string,
     body?: unknown,
     query?: Record<string, string | number | undefined>,
+    idempotencyKey?: string,
   ): Promise<T> {
     const qs = query
       ? `?${Object.entries(query)
@@ -224,6 +362,7 @@ export class Briq {
         authorization: `Bearer ${this.apiKey}`,
         'content-type': 'application/json',
         accept: 'application/json',
+        ...(idempotencyKey ? { 'idempotency-key': idempotencyKey } : {}),
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
@@ -241,26 +380,12 @@ export class Briq {
         res.headers.get('x-request-id') ?? undefined,
       );
     }
-    if (!res.ok) {
-      const e =
-        (
-          json as {
-            error?: { code?: string; message?: string; details?: unknown; requestId?: string };
-          }
-        ).error ?? {};
-      throw new BriqApiError(
-        res.status,
-        e.code ?? 'error',
-        e.message ?? `HTTP ${res.status}`,
-        e.details,
-        res.headers.get('x-request-id') ?? e.requestId ?? undefined,
-      );
-    }
+    if (!res.ok) throw this.failure(res, json);
     return json as T;
   }
 
-  run(input: RunInput) {
-    return this.call<RunResult>('POST', '/v1/briqs', input);
+  run(input: RunInput, opts?: CreateOptions) {
+    return this.create<RunResult>('/v1/briqs', input, opts);
   }
   list(opts: { stack?: string; all?: boolean } = {}) {
     return this.call<{ briqs: BriqRecord[]; costLine: string }>('GET', '/v1/briqs', undefined, {
@@ -271,24 +396,71 @@ export class Briq {
   status(id: string) {
     return this.call<{ briq: BriqRecord; costLine: string }>('GET', `/v1/briqs/${seg(id)}`);
   }
-  exec(id: string, cmd: string[], opts: { timeoutMs?: number; stdin?: string } = {}) {
+  /** An authenticated terminal handshake for a Node WebSocket client. Never put its headers in a URL. */
+  shellHandshake(id: string, opts: { cols?: number; rows?: number; term?: string } = {}) {
+    const url = new URL(`${this.baseUrl}/v1/briqs/${seg(id)}/shell`);
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    for (const [key, value] of Object.entries(opts))
+      if (value !== undefined) url.searchParams.set(key, String(value));
+    return { url: url.toString(), headers: { authorization: `Bearer ${this.apiKey}` } };
+  }
+  exec(
+    id: string,
+    cmd: string[],
+    opts: { timeoutMs?: number; stdin?: string } & ExecEnvOptions = {},
+  ) {
     return this.call<ExecResult>('POST', `/v1/briqs/${seg(id)}/exec`, { cmd, ...opts });
   }
-  /** Start a command and return at once: for anything that can take over a minute. */
-  execAsync(id: string, cmd: string[], opts: { timeoutMs?: number; stdin?: string } = {}) {
+  /**
+   * Start a command and return at once: for anything that can take over a minute. `stdinOpen`
+   * keeps its standard input open for `execInput`.
+   */
+  execAsync(
+    id: string,
+    cmd: string[],
+    opts: { timeoutMs?: number; stdin?: string; stdinOpen?: boolean } & ExecEnvOptions = {},
+  ) {
     return this.call<{ exec: Exec; costLine: string }>('POST', `/v1/briqs/${seg(id)}/exec`, {
       cmd,
       ...opts,
       async: true,
     });
   }
-  /** Where an async exec stands, with its output's tail; `waitMs` (45000 at most) waits for it to end. */
-  execStatus(id: string, execId: string, opts: { waitMs?: number } = {}) {
+  /**
+   * Where an async exec stands, with its output's tail; `waitMs` (45000 at most) waits for it to
+   * end. With `offset`, `exec.read` is one stream (`stream`, stdout by default) from that byte
+   * offset instead (`maxBytes`, 256 KB at most), and `waitMs` waits for output past it.
+   */
+  execStatus(
+    id: string,
+    execId: string,
+    opts: {
+      waitMs?: number;
+      offset?: number;
+      stream?: 'stdout' | 'stderr';
+      maxBytes?: number;
+    } = {},
+  ) {
     return this.call<{ exec: Exec; costLine: string }>(
       'GET',
       `/v1/briqs/${seg(id)}/execs/${seg(execId)}`,
       undefined,
       opts,
+    );
+  }
+  /**
+   * Write to the open stdin of an async exec: `data` (text) or `base64`, at most 64 KB, and with
+   * `eof` close it. `seq` (the last one plus one) makes it safe to send again.
+   */
+  execInput(
+    id: string,
+    execId: string,
+    input: { data?: string; base64?: string; eof?: boolean; seq?: number },
+  ) {
+    return this.call<{ seq: number; duplicate: boolean; costLine: string }>(
+      'POST',
+      `/v1/briqs/${seg(id)}/execs/${seg(execId)}/input`,
+      input,
     );
   }
   /** Stop an async exec and everything it started. */
@@ -329,6 +501,34 @@ export class Briq {
       undefined,
       { path },
     );
+  }
+  /**
+   * A file as raw bytes (`PUT /v1/briqs/{id}/files`): as large as `quota().maxFileBytes`, where
+   * `putFile` carries 1 MB. A stream is sent as it is read.
+   */
+  async putFileBytes(
+    id: string,
+    path: string,
+    content: Uint8Array | Blob | ReadableStream<Uint8Array>,
+  ) {
+    const res = await this.bytes('PUT', `/v1/briqs/${seg(id)}/files`, { path }, content);
+    return (await res.json()) as {
+      path: string;
+      bytes: number;
+      sha256: string;
+      verified: boolean;
+      warning?: string;
+    };
+  }
+  /** A file as a stream of raw bytes (`GET /v1/briqs/{id}/files/raw`): see `putFileBytes` for its size. */
+  async getFileStream(id: string, path: string): Promise<ReadableStream<Uint8Array>> {
+    const res = await this.bytes('GET', `/v1/briqs/${seg(id)}/files/raw`, { path });
+    return res.body ?? new Blob([]).stream();
+  }
+  /** A file as raw bytes, held whole. */
+  async getFileBytes(id: string, path: string): Promise<Uint8Array> {
+    const res = await this.bytes('GET', `/v1/briqs/${seg(id)}/files/raw`, { path });
+    return new Uint8Array(await res.arrayBuffer());
   }
   /**
    * `mode` left out keeps the mode the briq's URL already has (`public` when it has none).
@@ -380,16 +580,52 @@ export class Briq {
       ...opts,
     });
   }
+  /**
+   * The same briq at another size, or with a bigger volume (`volume.gb`, which only grows). A new
+   * size restarts a running briq; a stopped or sleeping one takes it at its next start. Answers
+   * once the change lands (up to 30 s), or with the briq still `resizing`.
+   */
+  resize(id: string, change: { size?: Size; volume?: { gb: number } }) {
+    return this.call<{ briq: BriqRecord; costLine: string }>(
+      'PATCH',
+      `/v1/briqs/${seg(id)}`,
+      change,
+    );
+  }
+  /**
+   * Put a briq in a stack (a name or an id; a new name makes the stack), or take it out with
+   * `null` (or `"default"`), into a network of its own. Briqs of one stack reach each other by
+   * name; a briq outside every stack reaches none. `restarted: true`: the machine was stopped and
+   * started again (its programs began over and its private IP changed), which a briq joining a
+   * stack that already has briqs does; a briq alone that joins a new stack, or leaves one, moves
+   * in place. `restarted: null`: still on its way, the briq `moving`. Answers once it lands (up
+   * to 30 s).
+   */
+  move(id: string, stack: string | null) {
+    return this.call<{ briq: BriqRecord; costLine: string; restarted: boolean | null }>(
+      'PATCH',
+      `/v1/briqs/${seg(id)}`,
+      { stack },
+    );
+  }
   /** A new briq starting from a copy of this one's disk; the source is left as it is. */
-  fork(id: string, opts: ForkLifetimes & { name?: string; stack?: string } = {}) {
-    return this.call<ForkResult>('POST', `/v1/briqs/${seg(id)}/fork`, opts);
+  fork(
+    id: string,
+    input: ForkLifetimes & { name?: string; stack?: string } = {},
+    opts?: CreateOptions,
+  ) {
+    return this.create<ForkResult>(`/v1/briqs/${seg(id)}/fork`, input, opts);
   }
   /**
    * Every briq of a stack, forked into a new stack under the same names. `expose` makes the fork
    * reachable from outside briq: outputs then name its endpoints.
    */
-  forkStack(stack: string, opts: ForkLifetimes & { into?: string; expose?: ExposeMode } = {}) {
-    return this.call<ForkResult>('POST', `/v1/stacks/${seg(stack)}/fork`, opts);
+  forkStack(
+    stack: string,
+    input: ForkLifetimes & { into?: string; expose?: ExposeMode } = {},
+    opts?: CreateOptions,
+  ) {
+    return this.create<ForkResult>(`/v1/stacks/${seg(stack)}/fork`, input, opts);
   }
   /** Destroy every briq of a stack; the empty stack stays. */
   destroyStack(stack: string) {
@@ -402,8 +638,8 @@ export class Briq {
    * Bring a stack up from its stack file: create the services it does not have, leave the others.
    * Never deletes.
    */
-  up(input: StackUpInput) {
-    return this.call<StackUpResult>('POST', '/v1/stacks/up', input);
+  up(input: StackUpInput, opts?: CreateOptions) {
+    return this.create<StackUpResult>('/v1/stacks/up', input, opts);
   }
   stacks() {
     return this.call<{
@@ -421,6 +657,19 @@ export class Briq {
   }
   quota() {
     return this.call<Quota>('GET', '/v1/quota');
+  }
+  /** The team's secrets: names, hosts and where they go; never a value. */
+  secrets() {
+    return this.call<{ secrets: TeamSecretOut[] }>('GET', '/v1/secrets');
+  }
+  createSecret(input: TeamSecretIn) {
+    return this.call<TeamSecretOut>('POST', '/v1/secrets', input);
+  }
+  updateSecret(id: string, patch: TeamSecretUpdate) {
+    return this.call<TeamSecretOut>('PATCH', `/v1/secrets/${seg(id)}`, patch);
+  }
+  deleteSecret(id: string) {
+    return this.call<{ ok: boolean }>('DELETE', `/v1/secrets/${seg(id)}`);
   }
   /** A bug, an idea or a question, emailed to the people who build briq. */
   feedback(input: { topic: SupportTopic; message: string }) {

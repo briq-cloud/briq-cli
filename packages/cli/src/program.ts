@@ -1,8 +1,11 @@
-import { readFileSync, writeFileSync } from 'node:fs';
+import { createReadStream, createWriteStream, readFileSync } from 'node:fs';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import {
   type EndpointProtocol,
   type ExposeMode,
   type FileContent,
+  type Size,
   type SupportTopic,
   formatMoney,
   slugify,
@@ -22,12 +25,13 @@ import { writeEnv } from './envfile.js';
 import { CliError, EXIT, notSignedIn, usage } from './errors.js';
 import { discover, pollForTokens, register, requestCode } from './oauth.js';
 import { VERSION, cliFetch, openSession } from './session.js';
+import { runShell } from './shell.js';
 import { registerUp } from './up.js';
 
 /**
- * The CLI: one command per MCP tool (`briq_exec` → `briq exec`, `briq_set_sleep` → `briq
+ * The CLI: commands follow the MCP tools (`briq_exec` → `briq exec`, `briq_set_sleep` → `briq
  * set-sleep`), with the tool's options as flags, each a call to `@briq/sdk`. What it adds is
- * only what a shell needs: signing in, files on disk, dotenv files, exit codes.
+ * what a terminal needs: signing in, files on disk, dotenv files, exit codes, and an interactive shell.
  */
 const program = new Command('briq')
   .description('Run services for your agents: databases, queues, any OCI image')
@@ -481,6 +485,26 @@ const execExit = (e: Exec) =>
   e.state === 'exited' ? (e.exitCode ?? 0) : e.state === 'running' ? 0 : EXIT.error;
 
 program
+  .command('shell')
+  .description('open an interactive shell in a briq; exit to leave it')
+  .argument('<briq>')
+  .action(
+    run(async (id: string) => {
+      if (json()) throw usage('briq shell is interactive and does not support --json');
+      if (!process.stdin.isTTY || !process.stdout.isTTY)
+        throw usage('briq shell needs an interactive terminal; use briq exec for scripts');
+      const { client: c } = await openSession();
+      process.exitCode = await runShell(
+        c.shellHandshake(id, {
+          cols: Math.min(1000, Math.max(1, process.stdout.columns || 80)),
+          rows: Math.min(1000, Math.max(1, process.stdout.rows || 24)),
+          term: process.env.TERM || 'xterm',
+        }),
+      );
+    }),
+  );
+
+program
   .command('exec')
   .description('run a command in a briq; exits with its code (briq_exec)')
   .allowUnknownOption()
@@ -489,21 +513,42 @@ program
   .option('--async', 'start it and return its exec id at once (for anything over a minute)')
   .option('--timeout <ms>', 'how long it may run')
   .option('--stdin', "feed this command's stdin to it")
+  .option('--stdin-open', 'with --async: keep its stdin open for briq exec-input')
+  .option(
+    '--env <K=V>',
+    'a variable for this command only (repeat it); kept off its command line',
+    (v: string, all: string[]) => [...all, v],
+    [] as string[],
+  )
+  .option('--clear-env', "start it from the briq's PATH, HOME and LANG only, then --env")
   .action(
     run(
       async (
         id: string,
         cmd: string[],
-        o: { async?: boolean; timeout?: string; stdin?: boolean },
+        o: {
+          async?: boolean;
+          timeout?: string;
+          stdin?: boolean;
+          stdinOpen?: boolean;
+          env: string[];
+          clearEnv?: boolean;
+        },
       ) => {
         const c = await client();
         const timeoutMs = int(o.timeout, '--timeout');
+        if (o.stdinOpen && !o.async) throw usage('--stdin-open needs --async');
         const opts = {
           ...(timeoutMs !== undefined ? { timeoutMs } : {}),
           ...(o.stdin ? { stdin: (await readStdin()).toString('utf8') } : {}),
+          ...(o.env.length ? { env: kv(o.env) } : {}),
+          ...(o.clearEnv ? { clearEnv: true } : {}),
         };
         if (o.async) {
-          const r = await c.execAsync(id, cmd, opts);
+          const r = await c.execAsync(id, cmd, {
+            ...opts,
+            ...(o.stdinOpen ? { stdinOpen: true } : {}),
+          });
           return out(
             r,
             () => `${execLine(r.exec)}\n${pc.dim(`briq exec-result ${id} ${r.exec.id}`)}`,
@@ -526,18 +571,84 @@ program
   .description('where a command started with --async stands, and its output (briq_exec_result)')
   .argument('<briq>')
   .argument('<exec>')
-  .option('--wait <ms>', 'wait this long for it to finish (45000 at most)')
+  .option('--wait <ms>', 'wait this long for it to finish, or with --offset for new output')
+  .option('--offset <n>', 'print the output from this byte instead of its tail, raw')
+  .option('--stream <name>', 'the stream --offset reads: stdout (default) or stderr')
+  .option('--max-bytes <n>', 'with --offset: the most to read (262144 at most)')
   .action(
-    run(async (id: string, execId: string, o: { wait?: string }) => {
-      const waitMs = int(o.wait, '--wait');
-      const r = await (await client()).execStatus(
-        id,
-        execId,
-        waitMs !== undefined ? { waitMs } : {},
-      );
-      out(r, () => execLine(r.exec));
-      process.exit(execExit(r.exec));
-    }),
+    run(
+      async (
+        id: string,
+        execId: string,
+        o: { wait?: string; offset?: string; stream?: string; maxBytes?: string },
+      ) => {
+        const waitMs = int(o.wait, '--wait');
+        const offset = int(o.offset, '--offset');
+        const maxBytes = int(o.maxBytes, '--max-bytes');
+        if (o.stream !== undefined && o.stream !== 'stdout' && o.stream !== 'stderr')
+          throw usage(`--stream is stdout or stderr, got "${o.stream}"`);
+        const r = await (await client()).execStatus(id, execId, {
+          ...(waitMs !== undefined ? { waitMs } : {}),
+          ...(offset !== undefined ? { offset } : {}),
+          ...(o.stream ? { stream: o.stream } : {}),
+          ...(maxBytes !== undefined ? { maxBytes } : {}),
+        });
+        const read = r.exec.read;
+        if (read && !json()) {
+          // The bytes as they are, for a pipe; where to go on from, for the person.
+          process.stdout.write(read.data);
+          note(
+            pc.dim(
+              read.eof
+                ? `${r.exec.id} ${r.exec.state}: the end of ${read.stream}`
+                : `next: briq exec-result ${id} ${execId} --offset ${read.nextOffset}`,
+            ),
+          );
+        } else out(r, () => execLine(r.exec));
+        process.exit(execExit(r.exec));
+      },
+    ),
+  );
+
+program
+  .command('exec-input')
+  .description('write to the stdin of a command started with --stdin-open (briq_exec_input)')
+  .argument('<briq>')
+  .argument('<exec>')
+  .argument('[text]', "what to write; - reads this command's stdin (any bytes)")
+  .option('--eof', 'close its input after this write')
+  .option(
+    '--seq <n>',
+    "this write's number, the last one plus one: sent again, it is not written twice",
+  )
+  .action(
+    run(
+      async (
+        id: string,
+        execId: string,
+        text: string | undefined,
+        o: { eof?: boolean; seq?: string },
+      ) => {
+        const seq = int(o.seq, '--seq');
+        if (text === undefined && !o.eof) throw usage('nothing to write: give text, -, or --eof');
+        const data =
+          text === '-'
+            ? { base64: (await readStdin()).toString('base64') }
+            : text !== undefined
+              ? { data: text }
+              : {};
+        const r = await (await client()).execInput(id, execId, {
+          ...data,
+          ...(o.eof ? { eof: true } : {}),
+          ...(seq !== undefined ? { seq } : {}),
+        });
+        out(
+          r,
+          () =>
+            `${r.duplicate ? `seq ${r.seq} was already written: nothing written` : `written as seq ${r.seq}`}${o.eof ? ', input closed' : ''}`,
+        );
+      },
+    ),
   );
 
 program
@@ -576,15 +687,21 @@ program
 
 program
   .command('files-put')
-  .description('upload a file into a briq, 1 MB at most (briq_files_put)')
+  .description(
+    'upload a file into a briq (briq_files_put); sent as it is read, up to the limit `briq quota` shows',
+  )
   .argument('<briq>')
   .argument('<path>', 'absolute path inside the briq')
   .argument('[file]', 'the local file; piped stdin without it')
   .action(
     run(async (id: string, path: string, file: string | undefined) => {
       if (!file && process.stdin.isTTY) throw usage('pass a local file, or pipe the content');
-      const bytes = file ? readFileSync(file) : await readStdin();
-      const r = await (await client()).putFile(id, path, bytes.toString('base64'));
+      const source = file ? createReadStream(file) : process.stdin;
+      const r = await (await client()).putFileBytes(
+        id,
+        path,
+        Readable.toWeb(source) as ReadableStream<Uint8Array>,
+      );
       out(
         r,
         () =>
@@ -595,20 +712,26 @@ program
 
 program
   .command('files-get')
-  .description('download a file from a briq, 1 MB at most (briq_files_get)')
+  .description(
+    'download a file from a briq (briq_files_get); up to the limit `briq quota` shows (--json: 1 MB)',
+  )
   .argument('<briq>')
   .argument('<path>', 'absolute path inside the briq')
   .option('-o, --out <file>', 'write it here instead of stdout')
   .action(
     run(async (id: string, path: string, o: { out?: string }) => {
-      const r = await (await client()).getFile(id, path);
-      const bytes = Buffer.from(r.contentBase64, 'base64');
-      if (json()) return console.log(JSON.stringify(r, null, 2));
+      const c = await client();
+      if (json()) return console.log(JSON.stringify(await c.getFile(id, path), null, 2));
+      const body = Readable.fromWeb((await c.getFileStream(id, path)) as never);
       if (o.out) {
-        writeFileSync(o.out, bytes);
-        return note(`${bytes.length} bytes written to ${o.out}`);
+        let bytes = 0;
+        body.on('data', (part: Buffer) => {
+          bytes += part.length;
+        });
+        await pipeline(body, createWriteStream(o.out));
+        return note(`${bytes} bytes written to ${o.out}`);
       }
-      process.stdout.write(bytes);
+      await pipeline(body, process.stdout, { end: false });
     }),
   );
 
@@ -778,6 +901,51 @@ program
   );
 
 program
+  .command('resize')
+  .description('another size, or a bigger volume, for the same briq (briq_resize)')
+  .argument('<briq>')
+  .option('--size <size>', 'the new size; a running briq restarts at it')
+  .option('--volume-gb <gb>', 'grow the volume to this many GB (it only grows)')
+  .action(
+    run(async (id: string, o: { size?: string; volumeGb?: string }) => {
+      if (!o.size && o.volumeGb === undefined) throw usage('pass --size, --volume-gb, or both');
+      const gb = o.volumeGb === undefined ? undefined : Number(o.volumeGb);
+      if (gb !== undefined && !Number.isInteger(gb))
+        throw usage('--volume-gb takes a whole number');
+      const r = await (await client()).resize(id, {
+        ...(o.size ? { size: o.size as Size } : {}),
+        ...(gb === undefined ? {} : { volume: { gb } }),
+      });
+      const { size, volume } = r.briq;
+      out(r, () => `${fmtBriq(r.briq)}  ${size}${volume ? `  volume ${volume.gb} GB` : ''}`);
+    }),
+  );
+
+program
+  .command('move')
+  .description('put a briq in a stack, or take it out with --out; may restart it (briq_move)')
+  .argument('<briq>')
+  .argument('[stack]', 'the stack to move it into; a new name makes the stack')
+  .option('--out', 'take it out of its stack, into a network of its own')
+  .action(
+    run(async (id: string, stack: string | undefined, o: { out?: boolean }) => {
+      if (!stack === !o.out) throw usage('pass a stack, or --out');
+      const r = await (await client()).move(id, o.out ? null : (stack as string));
+      out(
+        r,
+        () =>
+          `${fmtBriq(r.briq)}${
+            r.restarted === true
+              ? '  restarted: its processes started over and its private IP changed'
+              : r.restarted === null
+                ? '  still moving'
+                : ''
+          }`,
+      );
+    }),
+  );
+
+program
   .command('quota')
   .description('what this credential may still spend and run today (briq_quota)')
   .action(
@@ -787,6 +955,25 @@ program
         q,
         () =>
           `plan ${q.plan} · spent today ${money(q.spentTodayCents)} / ${money(q.policy.dailySpendCapCents)} · credits ${money(q.creditBalanceCents)} · ${q.liveBriqs} live, ${q.remainingConcurrency} more allowed`,
+      );
+    }),
+  );
+
+program
+  .command('secrets')
+  .description("the team's secrets: names and hosts, never a value (briq_secrets)")
+  .action(
+    run(async () => {
+      const r = await (await client()).secrets();
+      out(r, () =>
+        r.secrets.length
+          ? r.secrets
+              .map(
+                (x) =>
+                  `${x.name} → ${x.hosts.join(', ')} (${x.locations.join(', ')})${x.lastUsedAt ? pc.dim(` · used ${x.lastUsedAt}`) : ''}`,
+              )
+              .join('\n')
+          : 'no team secrets: add one on the dashboard (Secrets)',
       );
     }),
   );

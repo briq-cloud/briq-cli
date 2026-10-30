@@ -29,7 +29,10 @@ export const ImageRef = z
  * `creating`, `stopping`, `starting` and `destroying` are on their way to `running`, `stopped`,
  * `running` and `destroyed`. Asking for the same move again while one is in flight waits for it
  * instead of starting a second one. `sleeping`: stopped after its `sleep` without use, and woken by
- * the next use; `stopped` waits for `briq_start`.
+ * the next use; `stopped` waits for `briq_start`. `resizing`: getting another size or a bigger
+ * volume, then back to `running` (restarted for a new size) or to where it was stopped. `moving`: going
+ * into another stack or out of it, then back where it was (restarted when it joins a stack that
+ * already has briqs).
  */
 export const BriqState = z.enum([
   'creating',
@@ -38,6 +41,8 @@ export const BriqState = z.enum([
   'stopped',
   'sleeping',
   'starting',
+  'resizing',
+  'moving',
   'destroying',
   'destroyed',
   'error',
@@ -80,7 +85,7 @@ export const EnvName = z
   .regex(/^[A-Za-z_][A-Za-z0-9_.-]*$/, 'must be a variable name: letters, digits, _ . -');
 
 /** Bounds on what a spec may carry: it is returned with the briq in every list. */
-const MAX_ENV_VALUE = 32_768;
+export const MAX_ENV_VALUE = 32_768;
 const MAX_ENV_VARS = 100;
 const MAX_ARGS = 64;
 const MAX_ARG = 8_192;
@@ -99,24 +104,76 @@ export const toArgv = (c: Command): string[] => (typeof c === 'string' ? ['sh', 
 /**
  * A plain value, or a secret: write-only, stored encrypted, masked in status, logs and audit.
  * `{ secret: NAME }` alone has briq generate the value; `{ secret: NAME, value }` stores one the
- * caller has (a password from another service). Either way the spec keeps only `{ secret: NAME }`.
+ * caller has (a password from another service). Either way the spec keeps only `{ secret: NAME }`,
+ * and its `scope` when it has one.
+ *
+ * `scope: "boot"` keeps the secret out of the machine's environment, which every `briq_exec`
+ * inherits. It reaches the briq as a file the recipe's boot script reads for its steps (a clone,
+ * an install from a private registry) and deletes before the process starts: the code, and any
+ * command run later, cannot read it. Only a recipe with a boot script takes one (the language
+ * recipes, the sandbox); an image's own command has nothing that reads the file.
+ *
+ * `hosts` makes a secret of this briq's own that it never holds: the value is given here and
+ * stored for this briq, its environment gets a placeholder, and the team's credential gateway
+ * puts the real value into its outbound requests to those hosts, in `locations` (request headers
+ * unless said otherwise; `"body"` for a form or JSON field). For code that runs in a sandbox and
+ * calls an API with a credential.
+ *
+ * `scope: "team"` names a team secret (`POST /v1/secrets`, the dashboard's Secrets page), added
+ * once for every briq of the team, with its hosts: the same placeholder and gateway, the value
+ * never given here.
  */
+/** A host a secret may be sent to: `api.github.com`, or `*.example.com` for its subdomains. */
+export const SecretHost = z
+  .string()
+  .min(1)
+  .max(253)
+  .regex(
+    /^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i,
+    'a host name (api.github.com), or *.example.com for every subdomain',
+  )
+  .transform((h) => h.toLowerCase());
+
+/** Where in a request the placeholder is replaced: request headers, the body, or both. */
+export const SecretLocation = z.enum(['header', 'body']);
+export type SecretLocation = z.infer<typeof SecretLocation>;
+
 export const EnvValue = z.union([
   z.string().max(MAX_ENV_VALUE),
-  z.object({
-    secret: EnvName,
-    value: z
-      .string()
-      .max(MAX_ENV_VALUE)
-      // A reference is resolved from the stored spec (forks, the order a stack starts in), which
-      // never holds the value: put the address in a plain variable.
-      .refine((v) => refsIn([v]).length === 0, {
-        message:
-          'a secret value cannot hold a {{briq:…}} reference: put the address in a plain variable',
-      })
-      .optional(),
-  }),
+  z
+    .object({
+      secret: EnvName,
+      value: z
+        .string()
+        .max(MAX_ENV_VALUE)
+        // A reference is resolved from the stored spec (forks, the order a stack starts in), which
+        // never holds the value: put the address in a plain variable.
+        .refine((v) => refsIn([v]).length === 0, {
+          message:
+            'a secret value cannot hold a {{briq:…}} reference: put the address in a plain variable',
+        })
+        .optional(),
+      scope: z.enum(['boot', 'team']).optional(),
+      hosts: z.array(SecretHost).min(1).max(20).optional(),
+      locations: z.array(SecretLocation).min(1).optional(),
+    })
+    .strict(),
 ]);
+export type EnvValue = z.infer<typeof EnvValue>;
+/** A secret in env, as a marker (`{ secret }`) or with its value. */
+export type EnvSecret = Exclude<EnvValue, string>;
+/** A secret that must never be in the machine's environment: the boot steps' only. */
+export const isBootSecret = (v: EnvValue | undefined): v is EnvSecret & { scope: 'boot' } =>
+  typeof v === 'object' && v !== null && v.scope === 'boot';
+/** A team secret the credential gateway puts in: the briq holds a placeholder. */
+export const isTeamSecret = (v: EnvValue | undefined): v is EnvSecret & { scope: 'team' } =>
+  typeof v === 'object' && v !== null && v.scope === 'team';
+/** A secret of the briq's own that the credential gateway puts in (`hosts`): a placeholder too. */
+export const isProxiedSecret = (v: EnvValue | undefined): v is EnvSecret & { hosts: string[] } =>
+  typeof v === 'object' && v !== null && Array.isArray(v.hosts) && v.hosts.length > 0;
+/** A secret that reaches the briq as a placeholder and the destination as the value. */
+export const viaCredentialGateway = (v: EnvValue | undefined) =>
+  isTeamSecret(v) || isProxiedSecret(v);
 
 /** A volume's size when the spec does not say: small, since a team's plan bounds the disk it holds. */
 export const DEFAULT_VOLUME_GB = 2;
@@ -124,6 +181,17 @@ export const DEFAULT_VOLUME_GB = 2;
 export const VolumeSpec = z.object({
   mount: z.string().startsWith('/').max(255),
   gb: z.number().int().min(1).max(500).default(DEFAULT_VOLUME_GB),
+  /**
+   * `never`: what is on this volume stays on it. A fork of the briq is refused and the provider
+   * keeps no backup of it. For a volume that holds sign-ins, which a copy would let two machines
+   * use at once.
+   */
+  copy: z
+    .literal('never')
+    .optional()
+    .describe(
+      '"never": no fork of the briq and no backup of the volume, for one that holds sign-ins',
+    ),
 });
 
 /** Ports a spec may declare. Exposing a port it does not declare adds it, up to this. */
@@ -427,6 +495,12 @@ export const Briq = z.object({
     .describe('Its boot files, by path and size; their content is not returned'),
   /** The briq this one was forked from, when it is a fork. See `ForkCopy`. */
   forkedFrom: z.string().nullable().default(null),
+  /** Its volume, when it has one: kept until the briq is destroyed, grown by a resize. */
+  volume: z
+    .object({ mount: z.string(), gb: z.number().int() })
+    .nullable()
+    .default(null)
+    .describe('Its volume: where it is mounted and its size in GB; null without one'),
 });
 export type Briq = z.infer<typeof Briq>;
 
