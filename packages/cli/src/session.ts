@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { Briq } from '@briq/sdk';
+import { Briq } from '@briq-cloud/sdk';
 import {
   type Config,
   type Resolved,
@@ -70,6 +70,10 @@ export async function openSession(): Promise<Session> {
     apiUrl,
     config,
     resolved,
-    client: new Briq(token, { baseUrl: apiUrl, fetch: cliFetch }),
+    client: new Briq(token, {
+      baseUrl: apiUrl,
+      fetch: cliFetch,
+      execution: { fetch: globalThis.fetch },
+    }),
   };
 }

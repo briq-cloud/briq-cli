@@ -2,6 +2,19 @@ import { describe, expect, it } from 'vitest';
 import { exposeOf, parseStackFile } from './stack-file.js';
 
 describe('stack file', () => {
+  it('keeps image exit policy and refuses recipe exit policy', () => {
+    const image = parseStackFile({
+      stack: 'batch',
+      services: { worker: { image: 'alpine:3', onExit: 'destroy' } },
+    });
+    expect(image.ok && image.file.services.worker).toMatchObject({ onExit: 'destroy' });
+    expect(
+      parseStackFile({
+        stack: 'batch',
+        services: { worker: { recipe: 'redis', onExit: 'destroy' } },
+      }).ok,
+    ).toBe(false);
+  });
   it('reads a recipe with the fields it changes, and an image with its settings', () => {
     const r = parseStackFile({
       stack: 'shop',

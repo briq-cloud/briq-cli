@@ -1,5 +1,5 @@
 import type { ReadStream, WriteStream } from 'node:tty';
-import { BriqApiError } from '@briq/sdk';
+import { BriqApiError } from '@briq-cloud/sdk';
 import WebSocket, { type RawData } from 'ws';
 import { usage } from './errors.js';
 import { USER_AGENT } from './session.js';

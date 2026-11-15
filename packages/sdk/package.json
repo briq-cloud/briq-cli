@@ -1,25 +1,49 @@
 {
-  "name": "@briq/sdk",
-  "version": "0.0.0",
-  "private": true,
+  "name": "@briq-cloud/sdk",
+  "version": "0.2.0",
+  "description": "The TypeScript client for briq's REST API: run databases, sandboxes and any OCI image for your agents.",
+  "keywords": ["briq", "sdk", "agents", "sandbox", "postgres", "database", "api-client"],
+  "homepage": "https://briq.cloud",
+  "bugs": {
+    "email": "hello@briq.cloud"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/briq-cloud/briq-sdk.git",
+    "directory": "packages/sdk"
+  },
+  "license": "MIT",
   "type": "module",
+  "sideEffects": false,
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "default": "./dist/index.js"
     }
   },
+  "files": ["dist", "LICENSE"],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run --passWithNoTests"
+    "test": "vitest run --passWithNoTests",
+    "prepublishOnly": "node build.mjs"
   },
   "dependencies": {
-    "@briq/public": "workspace:*"
+    "ws": "^8.21.0"
   },
   "devDependencies": {
+    "@briq/public": "workspace:*",
+    "@types/ws": "8.18.1",
+    "esbuild": "0.25.12",
     "vitest": "^2.1.3"
   }
 }

@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Briq as BriqClient, StackUpInput, StackUpResult } from '@briq/sdk';
+import type { Briq as BriqClient, StackUpInput, StackUpResult } from '@briq-cloud/sdk';
 import { Command } from 'commander';
 import { describe, expect, it } from 'vitest';
 import { findStackFile, registerUp, secretValues, upReport } from './up.js';

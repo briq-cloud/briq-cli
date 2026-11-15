@@ -12,14 +12,39 @@ import type {
   TeamSecretOut,
   TeamSecretUpdate,
 } from '@briq/public';
+import { BriqApiError } from './errors.js';
+import { type ExecutionOptions, ExecutionRouter, unknownOutcome } from './execution.js';
 
 export type { BriqRecord, BriqSpecInput, ForkCopy, KeyPolicy, RecipeFields };
+export { BriqApiError };
+export type { ExecutionOptions };
+
+// The sandbox layer: create, find, exec, files, preview URL and destroy over the same client, for
+// adapters that put briq behind another SDK's sandbox interface.
+export { BriqOperationError, fail } from './native-errors.js';
+export type { OperationCode } from './native-errors.js';
+export { files } from './native-files.js';
+export type { FileInfo, NativeFiles } from './native-files.js';
+export { runArgv } from './native-exec.js';
+export type { Command, CommandResult, OutputChunk } from './native-command.js';
+export { nativeSandbox } from './native-sandbox.js';
+export type {
+  CreateInput,
+  ExecInput,
+  Labels,
+  NativeOptions,
+  SandboxSize,
+} from './native-sandbox.js';
 
 export interface RunResult {
   briqs: BriqRecord[];
   outputs: Record<string, string>;
   recipe: string | null;
   costLine: string;
+  /** True when every briq runs. False: one is still `creating` or failed (`state: "error"`). */
+  ready: boolean;
+  /** Why it is not ready, when `ready` is false. */
+  message?: string;
 }
 export interface ForkResult {
   briqs: BriqRecord[];
@@ -60,7 +85,7 @@ export interface StackUpResult {
   outputs: Record<string, string>;
   costLine: string;
 }
-interface ForkLifetimes {
+export interface ForkLifetimes {
   /** The fork's sleep (`"30m"`, `"3h"`, `"7d"`, `"never"`); the source's by default. */
   sleep?: string;
   wait?: boolean;
@@ -115,6 +140,8 @@ export interface ExecResult {
   stderr: string;
   exitCode: number;
   timedOut: boolean;
+  /** The provider kept only the start of stdout or stderr: the rest is dropped. */
+  truncated: boolean;
   costLine: string;
   /** Set when `timeoutMs` was over 60000 without async: it ran with 60000. */
   warning?: string;
@@ -125,6 +152,10 @@ export interface LogLine {
   line: string;
 }
 export interface Quota {
+  /** Absent on older APIs. Require each feature before using labels or literal secret inputs. */
+  features?: { briqLabels?: boolean; literalEnvSecrets?: boolean };
+  /** Sizes this credential may run here; absent from an older API. */
+  availableSizes?: Size[];
   plan: string;
   policy: KeyPolicy;
   spentTodayCents: number;
@@ -134,9 +165,16 @@ export interface Quota {
   liveBriqs: number;
   /** Live briqs in the whole team, whoever started them. */
   teamLiveBriqs: number;
+  /** Available capacity after both credential policy and team plan limits. */
   remainingConcurrency: number;
+  /** Team-wide plan allowance and available capacity; absent from an older API. */
+  maxConcurrentBriqs?: number;
+  remainingTeamConcurrency?: number;
   /** The longest `sleep` this credential may give, every limit taken; absent from an older API. */
   longestSleep?: string;
+  /** Memory GB the team's live briqs hold, and its plan's most; absent from an older API. */
+  memoryGb?: number;
+  maxMemoryGb?: number;
   /** Volume GB the team holds, stopped and failed briqs included, and its plan's most; absent from an older API. */
   diskGb?: number;
   maxDiskGb?: number;
@@ -207,23 +245,13 @@ export type RunInput =
  */
 const seg = (value: string) => encodeURIComponent(value);
 
-export class BriqApiError extends Error {
-  constructor(
-    readonly status: number,
-    readonly code: string,
-    message: string,
-    readonly details?: unknown,
-    /** The API's id for the failed request (`x-request-id`): quote it when asking for help. */
-    readonly requestId?: string,
-    /** The answer is a stored one, sent again for a repeated `Idempotency-Key`: sending it again gives the same. */
-    readonly replayed = false,
-  ) {
-    super(message);
-  }
-}
-
 /** What a call that creates briqs takes beside its input. */
 export interface CreateOptions {
+  /**
+   * `false`: do not ask for the first command's access, even with regional routing on. For a
+   * caller whose results reach a model, which must never hold it.
+   */
+  access?: false;
   /**
    * The call's `Idempotency-Key`. By default a new random one for each call, kept across the
    * client's own retries: a call that is sent twice makes its briqs once. Pass your own to repeat a
@@ -247,6 +275,8 @@ export interface BriqClientOptions {
   retryPauseMs?: number;
   /** Custom fetch, e.g. an in-process Hono `app.request` for tests or the hosted MCP server. */
   fetch?: typeof fetch;
+  /** Opt-in synchronous HTTP command routing. Other operations keep using the control API. */
+  execution?: ExecutionOptions;
 }
 
 /** Typed client over the briq REST API. One method per endpoint; the MCP tools and the CLI are built on it. */
@@ -254,6 +284,7 @@ export class Briq {
   private readonly baseUrl: string;
   private readonly f: typeof fetch;
   private readonly retryPauseMs: number;
+  private readonly execution: ExecutionRouter;
   constructor(
     private readonly apiKey: string,
     opts: BriqClientOptions = {},
@@ -261,6 +292,7 @@ export class Briq {
     this.baseUrl = (opts.baseUrl ?? 'https://api.briq.cloud').replace(/\/$/, '');
     this.f = opts.fetch ?? fetch;
     this.retryPauseMs = opts.retryPauseMs ?? RETRY_PAUSE_MS;
+    this.execution = new ExecutionRouter(opts.execution, opts.fetch !== undefined);
   }
 
   /**
@@ -349,6 +381,7 @@ export class Briq {
     body?: unknown,
     query?: Record<string, string | number | undefined>,
     idempotencyKey?: string,
+    accessDiscovery = false,
   ): Promise<T> {
     const qs = query
       ? `?${Object.entries(query)
@@ -365,7 +398,18 @@ export class Briq {
         ...(idempotencyKey ? { 'idempotency-key': idempotencyKey } : {}),
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...(accessDiscovery
+        ? {
+            redirect: 'error' as const,
+            cache: 'no-store' as const,
+            signal: AbortSignal.timeout(10_000),
+          }
+        : {}),
     });
+    return this.response<T>(res);
+  }
+
+  private async response<T>(res: Response): Promise<T> {
     const text = await res.text();
     // Not every answer is ours: a proxy in front of the API answers an outage with HTML.
     let json: Record<string, unknown> = {};
@@ -384,8 +428,30 @@ export class Briq {
     return json as T;
   }
 
-  run(input: RunInput, opts?: CreateOptions) {
-    return this.create<RunResult>('/v1/briqs', input, opts);
+  async run(input: RunInput, opts?: CreateOptions) {
+    // With regional routing on, the create also answers with the access for the first command.
+    // It goes into the client's cache and out of the result: nothing prints or stores it.
+    const access = opts?.access === false ? undefined : this.execution.accessRequest();
+    let result: RunResult & { access?: unknown };
+    try {
+      result = await this.create('/v1/briqs', access ? { ...input, access } : input, opts);
+    } catch (err) {
+      // An older API refuses the field before it creates anything.
+      if (
+        !access ||
+        !(err instanceof BriqApiError && err.status === 400 && err.code === 'validation')
+      )
+        throw err;
+      result = await this.create<RunResult>('/v1/briqs', input, opts);
+      this.execution.noCreateAccess();
+    }
+    if (access)
+      this.execution.seed(
+        result.access,
+        result.briqs.map((b) => b.id),
+      );
+    const { access: _grant, ...rest } = result;
+    return rest as RunResult;
   }
   list(opts: { stack?: string; all?: boolean } = {}) {
     return this.call<{ briqs: BriqRecord[]; costLine: string }>('GET', '/v1/briqs', undefined, {
@@ -404,12 +470,52 @@ export class Briq {
       if (value !== undefined) url.searchParams.set(key, String(value));
     return { url: url.toString(), headers: { authorization: `Bearer ${this.apiKey}` } };
   }
-  exec(
+  /** Discover bounded synchronous HTTP execution access. Contains an execution-only credential. */
+  executionAccess(id: string, maxCommands?: number): Promise<unknown> {
+    return this.call(
+      'POST',
+      `/v1/briqs/${seg(id)}/access`,
+      { version: 1, operations: ['exec'], ...(maxCommands ? { maxCommands } : {}) },
+      undefined,
+      undefined,
+      true,
+    );
+  }
+  async exec(
     id: string,
     cmd: string[],
     opts: { timeoutMs?: number; stdin?: string } & ExecEnvOptions = {},
   ) {
-    return this.call<ExecResult>('POST', `/v1/briqs/${seg(id)}/exec`, { cmd, ...opts });
+    const path = `/v1/briqs/${seg(id)}/exec`;
+    const body = { cmd, ...opts };
+    const access = await this.execution.access(id, (maxCommands) =>
+      this.executionAccess(id, maxCommands),
+    );
+    if (!access) return this.call<ExecResult>('POST', path, body);
+    const res = await this.execution.send(access, path, body);
+    // A status alone is not proof of no dispatch. No versioned pre-dispatch refusal
+    // contract is advertised yet, so every non-success regional response is uncertain.
+    if (!res.ok) {
+      res.body?.cancel().catch(() => {});
+      throw unknownOutcome(res.headers.get('x-request-id') ?? undefined);
+    }
+    try {
+      const result = await this.response<ExecResult>(res);
+      if (
+        !result ||
+        typeof result.stdout !== 'string' ||
+        typeof result.stderr !== 'string' ||
+        !Number.isInteger(result.exitCode) ||
+        typeof result.timedOut !== 'boolean' ||
+        typeof result.truncated !== 'boolean' ||
+        typeof result.costLine !== 'string'
+      )
+        throw unknownOutcome(res.headers.get('x-request-id') ?? undefined);
+      return result;
+    } catch {
+      this.execution.invalidate(id, access.token);
+      throw unknownOutcome(res.headers.get('x-request-id') ?? undefined);
+    }
   }
   /**
    * Start a command and return at once: for anything that can take over a minute. `stdinOpen`
@@ -538,11 +644,13 @@ export class Briq {
     id: string,
     port: number,
     mode?: ExposeMode,
-    opts: { rotate?: boolean; protocol?: EndpointProtocol } = {},
+    opts: { rotate?: boolean; protocol?: EndpointProtocol; additional?: boolean } = {},
   ) {
     return this.call<{
       id: string;
       port: number;
+      /** HTTP only: true for the front door, false for an additional URL. */
+      primary?: boolean;
       /** A database protocol: a TCP endpoint; absent or `http`: a URL. */
       protocol?: EndpointProtocol;
       mode: ExposeMode;
@@ -558,17 +666,33 @@ export class Briq {
       port,
       ...(mode ? { mode } : {}),
       ...(opts.rotate ? { rotate: true } : {}),
+      ...(opts.additional ? { additional: true } : {}),
       ...(opts.protocol ? { protocol: opts.protocol } : {}),
     });
   }
-  stop(id: string) {
-    return this.call<{ briq: BriqRecord }>('POST', `/v1/briqs/${seg(id)}/stop`);
+  unexpose(id: string, endpointId: string) {
+    return this.call<{ removed: boolean }>(
+      'DELETE',
+      `/v1/briqs/${seg(id)}/endpoints/${seg(endpointId)}`,
+    );
+  }
+  /** Keeps the disk. wait: false returns after enqueue; an already pending move is refused. Default true waits up to 30 s. */
+  stop(id: string, opts: { mode?: 'cold'; wait?: boolean } = {}) {
+    return this.call<{ briq: BriqRecord }>(
+      'POST',
+      `/v1/briqs/${seg(id)}/stop`,
+      Object.keys(opts).length ? opts : undefined,
+    );
   }
   start(id: string) {
     return this.call<{ briq: BriqRecord }>('POST', `/v1/briqs/${seg(id)}/start`);
   }
-  destroy(id: string) {
-    return this.call<{ briq: BriqRecord }>('DELETE', `/v1/briqs/${seg(id)}`);
+  /** Removes the briq and disk. wait: false returns after enqueue; an already pending move is refused. */
+  destroy(id: string, opts: { wait?: boolean } = {}) {
+    return this.call<{ briq: BriqRecord }>(
+      'DELETE',
+      `/v1/briqs/${seg(id)}${opts.wait === undefined ? '' : `?wait=${opts.wait}`}`,
+    );
   }
   /**
    * Change when a briq (or, with `stack: true`, every briq of its stack) goes to sleep: a string
@@ -583,9 +707,19 @@ export class Briq {
   /**
    * The same briq at another size, or with a bigger volume (`volume.gb`, which only grows). A new
    * size restarts a running briq; a stopped or sleeping one takes it at its next start. Answers
-   * once the change lands (up to 30 s), or with the briq still `resizing`.
+   * once the change lands (up to 30 s), or with the briq still `resizing`. Pass `image`,
+   * `healthcheck`, or both to configure a stopped briq. Null clears the check; omitted preserves
+   * it. It stays stopped; start it explicitly afterward. Send resource changes separately.
    */
-  resize(id: string, change: { size?: Size; volume?: { gb: number } }) {
+  resize(
+    id: string,
+    change: {
+      size?: Size;
+      volume?: { gb: number };
+      image?: string;
+      healthcheck?: BriqSpecInput['healthcheck'] | null;
+    },
+  ) {
     return this.call<{ briq: BriqRecord; costLine: string }>(
       'PATCH',
       `/v1/briqs/${seg(id)}`,
@@ -611,7 +745,7 @@ export class Briq {
   /** A new briq starting from a copy of this one's disk; the source is left as it is. */
   fork(
     id: string,
-    input: ForkLifetimes & { name?: string; stack?: string } = {},
+    input: ForkLifetimes & { name?: string; stack?: string; cmd?: BriqSpecInput['cmd'] } = {},
     opts?: CreateOptions,
   ) {
     return this.create<ForkResult>(`/v1/briqs/${seg(id)}/fork`, input, opts);
@@ -627,12 +761,12 @@ export class Briq {
   ) {
     return this.create<ForkResult>(`/v1/stacks/${seg(stack)}/fork`, input, opts);
   }
-  /** Destroy every briq of a stack; the empty stack stays. */
-  destroyStack(stack: string) {
+  /** Destroy every briq of a stack; the stack stays. wait: false returns after they are queued. */
+  destroyStack(stack: string, opts: { wait?: boolean } = {}) {
     return this.call<{
       stack: { id: string; name: string; createdAt: string };
       briqs: BriqRecord[];
-    }>('DELETE', `/v1/stacks/${seg(stack)}`);
+    }>('DELETE', `/v1/stacks/${seg(stack)}${opts.wait === undefined ? '' : `?wait=${opts.wait}`}`);
   }
   /**
    * Bring a stack up from its stack file: create the services it does not have, leave the others.

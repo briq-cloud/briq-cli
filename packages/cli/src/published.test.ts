@@ -44,11 +44,13 @@ describe('what the CLI publishes', () => {
       metafile: true,
       outfile: 'out.js',
       external: Object.keys(pkg.dependencies),
+      // As in build.mjs: the SDK from its source, so its sandbox layer is dropped.
+      alias: { '@briq-cloud/sdk': join(packages, 'sdk/src/index.ts') },
       logLevel: 'silent',
     });
     const inputs = Object.keys(out.metafile.inputs);
     expect(inputs.length).toBeGreaterThan(0);
-    expect(inputs.filter((f) => !/^(?:cli\/src|sdk\/dist|public\/dist)\//.test(f))).toEqual([]);
+    expect(inputs.filter((f) => !/^(?:cli\/src|sdk\/src|public\/dist)\//.test(f))).toEqual([]);
   });
 
   it.each(sources)('%s names nothing internal', (file) => {

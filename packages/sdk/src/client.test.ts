@@ -87,6 +87,26 @@ describe('Briq client', () => {
       wait: false,
     });
   });
+  it.each([
+    { image: 'ubuntu:24.04' },
+    { healthcheck: null },
+    { image: 'ubuntu:24.04', healthcheck: { cmd: ['true'] } },
+  ])('sends a stopped configuration PATCH without starting the briq: %j', async (change) => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const c = new Briq('k', {
+      baseUrl: 'http://api.test',
+      fetch: fakeFetch((url, init) => {
+        calls.push({ url, init });
+        return { status: 200, body: { briq: { state: 'stopped', image: 'ubuntu:24.04' } } };
+      }),
+    });
+    const result = await c.resize('bq_1', change);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe('http://api.test/v1/briqs/bq_1');
+    expect(calls[0]?.init.method).toBe('PATCH');
+    expect(JSON.parse(String(calls[0]?.init.body))).toEqual(change);
+    expect(result.briq.state).toBe('stopped');
+  });
   it('throws typed errors', async () => {
     const c = new Briq('k', {
       baseUrl: 'http://api.test',
@@ -114,11 +134,16 @@ describe('Briq client', () => {
         };
       }),
     });
-    await c.fork('bq_1', { name: 'db-try' });
+    await c.fork('bq_1', { name: 'db-try', cmd: ['python', '/work/worker.py'] });
+    await c.fork('bq_2', { cmd: 'echo ready' });
     await c.forkStack('default', { into: 'try' });
     await c.forkStack('main', { into: 'feat-x', expose: 'private' });
     expect(calls).toEqual([
-      { url: 'http://api.test/v1/briqs/bq_1/fork', body: { name: 'db-try' } },
+      {
+        url: 'http://api.test/v1/briqs/bq_1/fork',
+        body: { name: 'db-try', cmd: ['python', '/work/worker.py'] },
+      },
+      { url: 'http://api.test/v1/briqs/bq_2/fork', body: { cmd: 'echo ready' } },
       { url: 'http://api.test/v1/stacks/default/fork', body: { into: 'try' } },
       { url: 'http://api.test/v1/stacks/main/fork', body: { into: 'feat-x', expose: 'private' } },
     ]);
@@ -358,4 +383,47 @@ describe('creating calls', () => {
     expect(n).toBe(2);
     expect(keys).toEqual([null, null]);
   });
+});
+
+it('addresses an additional HTTP URL and unpublishes only its encoded endpoint', async () => {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const client = new Briq('key', {
+    baseUrl: 'https://api.test',
+    fetch: fakeFetch((url, init) => {
+      calls.push({ url, init });
+      return { status: 200, body: {} };
+    }),
+  });
+  await client.expose('bq_1', 3773, 'private', { additional: true });
+  expect(JSON.parse(String(calls[0]!.init.body))).toEqual({
+    port: 3773,
+    mode: 'private',
+    additional: true,
+  });
+  await client.unexpose('bq_1', 'ep/other');
+  expect(calls[1]!.url).toBe('https://api.test/v1/briqs/bq_1/endpoints/ep%2Fother');
+  expect(calls[1]!.init.method).toBe('DELETE');
+});
+
+it('sends wait only when requested on stop and both destroy forms', async () => {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const client = new Briq('key', {
+    baseUrl: 'https://api.test',
+    fetch: fakeFetch((url, init) => {
+      calls.push({ url, init });
+      return { status: 200, body: {} };
+    }),
+  });
+  await client.stop('bq_one');
+  await client.stop('bq_one', { mode: 'cold', wait: false });
+  await client.destroy('bq_one');
+  await client.destroy('bq_one', { wait: false });
+  await client.destroyStack('my stack', { wait: true });
+  expect(calls[0]?.init.body).toBeUndefined();
+  expect(JSON.parse(String(calls[1]?.init.body))).toEqual({ mode: 'cold', wait: false });
+  expect(calls.slice(2).map((c) => c.url)).toEqual([
+    'https://api.test/v1/briqs/bq_one',
+    'https://api.test/v1/briqs/bq_one?wait=false',
+    'https://api.test/v1/stacks/my%20stack?wait=true',
+  ]);
 });

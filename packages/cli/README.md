@@ -16,11 +16,11 @@ npm install -g @briq-cloud/cli
 | Command | When |
 | --- | --- |
 | `briq login` | On your machine. Open the link it prints, pick the team and the budget, approve. |
-| `cat key.txt \| briq login --key` | With an API key from the dashboard's Agents page. |
+| `cat key.txt \| briq login --key` | With an API key from the dashboard's API keys page. |
 | `export BRIQ_API_KEY=bq_live_…` | In CI, a container or an agent. It wins over a saved sign-in. |
 
 `briq whoami` shows the team, the credential and its budget. `briq logout` forgets the sign-in on
-this machine. Revoke it on the dashboard's Agents page.
+this machine. Revoke a browser sign-in on **Agents & CLI**, or a key on **API keys**.
 
 ## Run a service
 

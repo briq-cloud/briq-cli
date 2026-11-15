@@ -2,6 +2,21 @@ import { describe, expect, it } from 'vitest';
 import { runInput } from './program.js';
 
 describe('briq run', () => {
+  it('sends an image exit policy and rejects it for recipes', () => {
+    expect(runInput('alpine:3', { wait: true, onExit: 'destroy' })).toMatchObject({
+      spec: { onExit: 'destroy' },
+    });
+    expect(() => runInput('redis', { wait: true, onExit: 'retain' })).toThrow('for an image run');
+    expect(() => runInput('alpine:3', { wait: true, onExit: 'bad' })).toThrow('retain or destroy');
+  });
+  it.each(['sandbox', 'postgres', 'redis-bullmq'])(
+    'keeps the bare %s recipe input compatible with the waiting MCP example',
+    (recipe) => {
+      // Commander enables wait unless --no-wait is passed.
+      expect(runInput(recipe, { wait: true })).toEqual({ recipe, wait: true });
+    },
+  );
+
   it('puts a recipe’s fields beside it, as briq_run takes them', () => {
     process.env.GH_TOKEN_TEST = 'ghp_x';
     expect(

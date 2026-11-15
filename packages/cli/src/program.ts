@@ -1,17 +1,16 @@
-import { createReadStream, createWriteStream, readFileSync } from 'node:fs';
+import { createReadStream, createWriteStream } from 'node:fs';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { Briq, BriqApiError, type Exec, type Quota } from '@briq-cloud/sdk';
 import {
   type EndpointProtocol,
-  type ExposeMode,
-  type FileContent,
+  Healthcheck,
   type Size,
   type SupportTopic,
   formatMoney,
   slugify,
 } from '@briq/public';
-import { Briq, BriqApiError, type Exec, type Quota, type RunInput } from '@briq/sdk';
-import { Command, CommanderError } from 'commander';
+import { Command, CommanderError, Option } from 'commander';
 import pc from 'picocolors';
 import {
   type StoredCredential,
@@ -24,13 +23,15 @@ import {
 import { writeEnv } from './envfile.js';
 import { CliError, EXIT, notSignedIn, usage } from './errors.js';
 import { discover, pollForTokens, register, requestCode } from './oauth.js';
+import { type RunFlags, kv, mode, runInput } from './run-input.js';
 import { VERSION, cliFetch, openSession } from './session.js';
 import { runShell } from './shell.js';
 import { registerUp } from './up.js';
+export { runInput } from './run-input.js';
 
 /**
  * The CLI: commands follow the MCP tools (`briq_exec` → `briq exec`, `briq_set_sleep` → `briq
- * set-sleep`), with the tool's options as flags, each a call to `@briq/sdk`. What it adds is
+ * set-sleep`), with the tool's options as flags, each a call to `@briq-cloud/sdk`. What it adds is
  * what a terminal needs: signing in, files on disk, dotenv files, exit codes, and an interactive shell.
  */
 const program = new Command('briq')
@@ -98,26 +99,12 @@ const state = (s: string) =>
         ? pc.dim(s)
         : pc.yellow(s)
   ).padEnd(10);
-
-const mode = (v: string | undefined): ExposeMode | undefined => {
-  if (v === undefined) return undefined;
-  if (v !== 'private' && v !== 'public') throw usage(`expected private or public, got "${v}"`);
-  return v;
-};
 const int = (v: string | undefined, what: string) => {
   if (v === undefined) return undefined;
   const n = Number(v);
   if (!Number.isInteger(n)) throw usage(`${what} must be a whole number, got "${v}"`);
   return n;
 };
-const kv = (arr?: string[]) =>
-  Object.fromEntries(
-    (arr ?? []).map((s) => {
-      const i = s.indexOf('=');
-      if (i < 1) throw usage(`expected key=value, got "${s}"`);
-      return [s.slice(0, i), s.slice(i + 1)];
-    }),
-  );
 async function readStdin(): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
@@ -142,7 +129,7 @@ function describe(q: Quota, source: string, apiUrl: string) {
     ['as', who],
     [
       'budget',
-      `${money(p.dailySpendCapCents)} a day, ${p.maxConcurrentBriqs} briqs at once, sizes ${p.allowedSizes.join(', ')}`,
+      `${money(p.dailySpendCapCents)} a day, ${p.maxConcurrentBriqs ?? 'the plan default'} briqs at once, sizes ${p.allowedSizes.join(', ')}`,
     ],
     ['api', `${apiUrl} (${environmentOf(apiUrl)})`],
   ]
@@ -215,12 +202,12 @@ const dashboardOf = (apiUrl: string) =>
 
 program
   .command('logout')
-  .description('forget the saved sign-in (revoke it on the dashboard’s Agents page)')
+  .description('forget the saved sign-in (revoke it on the dashboard)')
   .action(
     run(() => {
       const cfg = loadConfig();
       const cred = cfg.credential;
-      const agents = `${dashboardOf(apiUrlOf(cfg))}/agents`;
+      const agents = `${dashboardOf(apiUrlOf(cfg))}/${cred?.kind === 'key' ? 'keys' : 'agents'}`;
       if (!cred) note(`not signed in to ${apiUrlOf(cfg)}`);
       else {
         saveConfig({ ...(cfg.apiUrl ? { apiUrl: cfg.apiUrl } : {}) });
@@ -283,135 +270,16 @@ program
     }),
   );
 
-/** `--file <path>=<local file>`: text as it is, anything else as base64. */
-const filesOf = (arr?: string[]): Record<string, FileContent> | undefined => {
-  if (!arr?.length) return undefined;
-  const utf8 = new TextDecoder('utf-8', { fatal: true });
-  return Object.fromEntries(
-    Object.entries(kv(arr)).map(([path, local]) => {
-      const bytes = readFileSync(local);
-      try {
-        return [path, utf8.decode(bytes)];
-      } catch {
-        return [path, { base64: bytes.toString('base64') }];
-      }
-    }),
-  );
-};
-const portsOf = (arr?: string[]): number[] | undefined =>
-  arr?.map((p) => {
-    const n = Number(p);
-    if (!Number.isInteger(n) || n < 1 || n > 65535) throw usage(`--port ${p}: a port number`);
-    return n;
-  });
-const intOf = (flag: string, v?: string): number | undefined => {
-  if (v === undefined) return undefined;
-  const n = Number(v);
-  if (!Number.isInteger(n) || n < 1) throw usage(`${flag} ${v}: a whole number`);
-  return n;
-};
-
-interface RunFlags {
-  name?: string;
-  stack?: string;
-  size?: string;
-  sleep?: string;
-  expose?: string;
-  image?: string;
-  env?: string[];
-  cmd?: string;
-  port?: string[];
-  file?: string[];
-  volume?: string;
-  volumeGb?: string;
-  checkout?: string;
-  ref?: string;
-  path?: string;
-  token?: string;
-  step?: string[];
-  wait: boolean;
-}
-
-/** `briq run`'s body: an image's spec, or a recipe with the fields beside it (`RecipeFields`). */
-export function runInput(target: string, o: RunFlags): RunInput {
-  const expose = mode(o.expose);
-  const env = o.env?.length ? kv(o.env) : undefined;
-  const ports = portsOf(o.port);
-  const files = filesOf(o.file);
-  const gb = intOf('--volume-gb', o.volumeGb);
-  const common = {
-    ...(o.stack ? { stack: o.stack } : {}),
-    ...(expose ? { expose } : {}),
-    wait: o.wait,
-  };
-  if (target.includes(':') || target.includes('/')) {
-    for (const [flag, v] of [
-      ['--image', o.image],
-      ['--checkout', o.checkout],
-      ['--step', o.step],
-    ] as const)
-      if (v !== undefined) throw usage(`${flag} is for a recipe; ${target} is an image`);
-    if (gb !== undefined && !o.volume) throw usage('--volume-gb needs --volume <mount path>');
-    return {
-      spec: {
-        name: o.name ?? target.split('/').pop()?.split(':')[0] ?? 'app',
-        image: target,
-        ...(env ? { env } : {}),
-        ...(o.cmd ? { cmd: o.cmd } : {}),
-        ...(ports ? { ports } : {}),
-        ...(files ? { files } : {}),
-        ...(o.volume ? { volume: { mount: o.volume, ...(gb ? { gb } : {}) } } : {}),
-        ...(o.size ? { size: o.size as 'small' } : {}),
-        ...(o.sleep ? { sleep: o.sleep } : {}),
-      },
-      ...common,
-    };
-  }
-  if (o.volume)
-    throw usage('--volume is for an image: a recipe mounts its own, size it with --volume-gb');
-  if (!o.checkout)
-    for (const [flag, v] of [
-      ['--ref', o.ref],
-      ['--path', o.path],
-      ['--token', o.token],
-    ] as const)
-      if (v !== undefined) throw usage(`${flag} needs --checkout <repo>`);
-  // A repo token travels as a secret's name; its value only from the environment, never a flag.
-  const token = o.token
-    ? { secret: o.token, ...(process.env[o.token] ? { value: process.env[o.token] } : {}) }
-    : undefined;
-  return {
-    recipe: target,
-    ...(o.name ? { name: o.name } : {}),
-    ...(o.image ? { image: o.image } : {}),
-    ...(env ? { env } : {}),
-    ...(o.cmd ? { cmd: o.cmd } : {}),
-    ...(o.size ? { size: o.size as 'small' } : {}),
-    ...(gb ? { volume: { gb } } : {}),
-    ...(files ? { files } : {}),
-    ...(ports ? { ports } : {}),
-    ...(o.checkout
-      ? {
-          checkout: {
-            repo: o.checkout,
-            ...(o.ref ? { ref: o.ref } : {}),
-            ...(o.path ? { path: o.path } : {}),
-            ...(token ? { token } : {}),
-          },
-        }
-      : {}),
-    ...(o.step?.length ? { steps: o.step.map((run) => ({ run })) } : {}),
-    ...(o.sleep ? { sleep: o.sleep } : {}),
-    ...common,
-  };
-}
-
 program
   .command('run')
   .description('run a recipe or an image (briq_run)')
   .argument('<recipeOrImage>', 'recipe name (postgres) or image (nginx:1.27)')
   .option('-n, --name <name>')
   .option('-s, --stack <stack>')
+  .option(
+    '--on-exit <policy>',
+    'image only: retain (default), or destroy disks and logs after final main process exit',
+  )
   .option('--size <size>')
   .option('--sleep <sleep>', 'sleep after this long without use: 30m, 3h, 7d, or never')
   .option('--expose <mode>', 'publish the front door: private or public')
@@ -509,7 +377,7 @@ program
   .description('run a command in a briq; exits with its code (briq_exec)')
   .allowUnknownOption()
   .argument('<briq>')
-  .argument('<cmd...>', 'the command; flags after the briq id go to it')
+  .argument('<cmd...>', 'the command; use -- before it to preserve all command flags')
   .option('--async', 'start it and return its exec id at once (for anything over a minute)')
   .option('--timeout <ms>', 'how long it may run')
   .option('--stdin', "feed this command's stdin to it")
@@ -535,7 +403,7 @@ program
           clearEnv?: boolean;
         },
       ) => {
-        const c = await client();
+        const c = (await openSession()).client;
         const timeoutMs = int(o.timeout, '--timeout');
         if (o.stdinOpen && !o.async) throw usage('--stdin-open needs --async');
         const opts = {
@@ -745,16 +613,18 @@ program
     '--protocol <protocol>',
     'a TCP endpoint: postgres, mysql, redis, mongodb, amqp, bolt or grpc',
   )
+  .option('--additional', 'give this HTTP port a separate URL, keeping the front door')
   .option('--rotate', 'a new token for a private URL; the old one stops working')
   .action(
     run(
       async (
         id: string,
         port: string,
-        o: { mode?: string; protocol?: string; rotate?: boolean },
+        o: { mode?: string; protocol?: string; rotate?: boolean; additional?: boolean },
       ) => {
         const r = await (await client()).expose(id, int(port, 'port') as number, mode(o.mode), {
           rotate: o.rotate === true,
+          additional: o.additional === true,
           ...(o.protocol ? { protocol: o.protocol as EndpointProtocol } : {}),
         });
         out(r, () =>
@@ -762,6 +632,18 @@ program
         );
       },
     ),
+  );
+
+program
+  .command('unexpose')
+  .description('remove an HTTP URL by endpoint id (briq_unexpose)')
+  .argument('<briq>')
+  .argument('<endpoint>')
+  .action(
+    run(async (id: string, endpoint: string) => {
+      const r = await (await client()).unexpose(id, endpoint);
+      out(r, () => (r.removed ? 'URL removed' : 'URL already absent'));
+    }),
   );
 
 program
@@ -780,6 +662,7 @@ program
     'stack fork: into the stack a git branch names (feat/login → feat-login)',
   )
   .option('--name <name>', 'single fork: its name (default <name>-fork)')
+  .option('--cmd <command>', 'single raw-image fork with a copied volume: CMD, run with sh -c')
   .option('--sleep <sleep>', "the forks' sleep; the source's by default")
   .option(
     '--expose [mode]',
@@ -795,6 +678,7 @@ program
           stack?: string;
           into?: string;
           branch?: string;
+          cmd?: string;
           name?: string;
           sleep?: string;
           expose?: string | true;
@@ -809,6 +693,7 @@ program
         // A branch's fork is the stack its name makes, as the API and MCP name it.
         const into = o.into ?? (o.branch ? slugify(o.branch) : undefined);
         if (!id && o.name) throw usage('--name is for a single fork');
+        if (!id && o.cmd !== undefined) throw usage('--cmd is for a single fork');
         if (o.env && !o.wait) throw usage('--env needs the forks ready: leave out --no-wait');
         const expose = o.expose === true ? 'private' : mode(o.expose);
         const c = await client();
@@ -819,6 +704,7 @@ program
         };
         const res = id
           ? await c.fork(id, {
+              ...(o.cmd === undefined ? {} : { cmd: o.cmd }),
               ...common,
               ...(o.name ? { name: o.name } : {}),
               ...(o.stack ? { stack: o.stack } : {}),
@@ -854,35 +740,44 @@ program
   );
 
 for (const a of ['stop', 'start'] as const) {
-  program
-    .command(a)
-    .description(`${a} a briq (briq_${a})`)
-    .argument('<briq>')
-    .action(
-      run(async (id: string) => {
-        const r = await (await client())[a](id);
-        out(r, () => fmtBriq(r.briq));
-      }),
-    );
+  const command = program.command(a).description(`${a} a briq (briq_${a})`).argument('<briq>');
+  if (a === 'stop')
+    command
+      .option('--cold', 'discard the memory snapshot; the next start boots the image')
+      .option('--no-wait', 'return after the stop is queued');
+  command.action(
+    run(async (id: string, opts: { cold?: boolean; wait?: boolean }) => {
+      const c = await client();
+      const r =
+        a === 'stop'
+          ? await c.stop(id, {
+              ...(opts.cold ? { mode: 'cold' as const } : {}),
+              ...(opts.wait === false ? { wait: false } : {}),
+            })
+          : await c.start(id);
+      out(r, () => fmtBriq(r.briq));
+    }),
+  );
 }
 
 program
   .command('destroy')
   .description('destroy a briq, or with --stack every briq of a stack (briq_destroy)')
+  .option('--no-wait', 'return after destruction is queued')
   .argument('[briq]')
   .option('-s, --stack <stack>', 'a stack, by name or id')
   .option('--branch <branch>', 'the stack a git branch names, as fork --branch made it')
   .action(
-    run(async (id: string | undefined, o: { stack?: string; branch?: string }) => {
+    run(async (id: string | undefined, o: { stack?: string; branch?: string; wait?: boolean }) => {
       const stack = o.stack ?? (o.branch ? slugify(o.branch) : undefined);
       if (!id === !stack || (o.stack && o.branch))
         throw usage('pass a briq id, --stack or --branch');
       const c = await client();
       if (stack) {
-        const r = await c.destroyStack(stack);
+        const r = await c.destroyStack(stack, o.wait === false ? { wait: false } : {});
         return out(r, () => [`stack ${r.stack.name}`].concat(r.briqs.map(fmtBriq)).join('\n'));
       }
-      const r = await c.destroy(id as string);
+      const r = await c.destroy(id as string, o.wait === false ? { wait: false } : {});
       out(r, () => fmtBriq(r.briq));
     }),
   );
@@ -902,23 +797,55 @@ program
 
 program
   .command('resize')
-  .description('another size, or a bigger volume, for the same briq (briq_resize)')
+  .description('change size, volume, or a stopped briq image (briq_resize)')
   .argument('<briq>')
+  .option('--image <image>', 'change a stopped briq image; start it explicitly afterward')
+  .option(
+    '--healthcheck <json>',
+    'replace a stopped briq healthcheck; JSON object, or null to clear',
+  )
   .option('--size <size>', 'the new size; a running briq restarts at it')
   .option('--volume-gb <gb>', 'grow the volume to this many GB (it only grows)')
   .action(
-    run(async (id: string, o: { size?: string; volumeGb?: string }) => {
-      if (!o.size && o.volumeGb === undefined) throw usage('pass --size, --volume-gb, or both');
-      const gb = o.volumeGb === undefined ? undefined : Number(o.volumeGb);
-      if (gb !== undefined && !Number.isInteger(gb))
-        throw usage('--volume-gb takes a whole number');
-      const r = await (await client()).resize(id, {
-        ...(o.size ? { size: o.size as Size } : {}),
-        ...(gb === undefined ? {} : { volume: { gb } }),
-      });
-      const { size, volume } = r.briq;
-      out(r, () => `${fmtBriq(r.briq)}  ${size}${volume ? `  volume ${volume.gb} GB` : ''}`);
-    }),
+    run(
+      async (
+        id: string,
+        o: { size?: string; volumeGb?: string; image?: string; healthcheck?: string },
+      ) => {
+        if (
+          (o.image !== undefined || o.healthcheck !== undefined) &&
+          (o.size !== undefined || o.volumeGb !== undefined)
+        )
+          throw usage('pass --image and --healthcheck separately from --size or --volume-gb');
+        if (
+          !o.size &&
+          o.volumeGb === undefined &&
+          o.image === undefined &&
+          o.healthcheck === undefined
+        )
+          throw usage('pass --size, --volume-gb, --image, or --healthcheck');
+        let healthcheck: ReturnType<typeof Healthcheck.parse> | null | undefined;
+        if (o.healthcheck !== undefined) {
+          try {
+            const value = JSON.parse(o.healthcheck);
+            healthcheck = value === null ? null : Healthcheck.parse(value);
+          } catch {
+            throw usage('--healthcheck takes a healthcheck JSON object or null');
+          }
+        }
+        const gb = o.volumeGb === undefined ? undefined : Number(o.volumeGb);
+        if (gb !== undefined && !Number.isInteger(gb))
+          throw usage('--volume-gb takes a whole number');
+        const r = await (await client()).resize(id, {
+          ...(o.image === undefined ? {} : { image: o.image }),
+          ...(healthcheck === undefined ? {} : { healthcheck }),
+          ...(o.size ? { size: o.size as Size } : {}),
+          ...(gb === undefined ? {} : { volume: { gb } }),
+        });
+        const { size, volume } = r.briq;
+        out(r, () => `${fmtBriq(r.briq)}  ${size}${volume ? `  volume ${volume.gb} GB` : ''}`);
+      },
+    ),
   );
 
 program

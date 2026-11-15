@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import type { Briq as BriqClient, BriqRecord, StackUpResult } from '@briq-cloud/sdk';
 import { STACK_FILE_NAME } from '@briq/public';
-import type { Briq as BriqClient, BriqRecord, StackUpResult } from '@briq/sdk';
 import type { Command } from 'commander';
 import pc from 'picocolors';
 import { writeEnv } from './envfile.js';

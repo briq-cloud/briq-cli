@@ -104,7 +104,7 @@ export const toArgv = (c: Command): string[] => (typeof c === 'string' ? ['sh', 
 /**
  * A plain value, or a secret: write-only, stored encrypted, masked in status, logs and audit.
  * `{ secret: NAME }` alone has briq generate the value; `{ secret: NAME, value }` stores one the
- * caller has (a password from another service). Either way the spec keeps only `{ secret: NAME }`,
+ * caller has (a password from another service). Either way the spec keeps only the marker (`{ secret: NAME }`, plus `literal: true` when given),
  * and its `scope` when it has one.
  *
  * `scope: "boot"` keeps the secret out of the machine's environment, which every `briq_exec`
@@ -138,27 +138,75 @@ export const SecretHost = z
 export const SecretLocation = z.enum(['header', 'body']);
 export type SecretLocation = z.infer<typeof SecretLocation>;
 
+/** OS environment keys: any nonempty name except `=` and NUL, within spec bounds. */
+export const EnvKey = z
+  .string()
+  .min(1)
+  .max(128)
+  .refine((v) => !/[=\0]/.test(v), 'environment names cannot contain = or NUL');
+
 export const EnvValue = z.union([
-  z.string().max(MAX_ENV_VALUE),
+  z
+    .string()
+    .max(MAX_ENV_VALUE)
+    .refine((v) => !v.includes('\0'), 'environment values cannot contain NUL'),
   z
     .object({
       secret: EnvName,
       value: z
         .string()
         .max(MAX_ENV_VALUE)
-        // A reference is resolved from the stored spec (forks, the order a stack starts in), which
-        // never holds the value: put the address in a plain variable.
-        .refine((v) => refsIn([v]).length === 0, {
-          message:
-            'a secret value cannot hold a {{briq:…}} reference: put the address in a plain variable',
-        })
+        .refine((v) => !v.includes('\0'), 'environment values cannot contain NUL')
         .optional(),
+      literal: z.literal(true).optional(),
       scope: z.enum(['boot', 'team']).optional(),
       hosts: z.array(SecretHost).min(1).max(20).optional(),
       locations: z.array(SecretLocation).min(1).optional(),
     })
-    .strict(),
+    .strict()
+    .superRefine((v, ctx) => {
+      if (
+        v.literal &&
+        (v.scope !== undefined || v.hosts !== undefined || v.locations !== undefined)
+      )
+        ctx.addIssue({
+          code: 'custom',
+          message: 'literal secrets cannot have scope, hosts or locations',
+        });
+      if (!v.literal && v.value !== undefined && refsIn([v.value]).length)
+        ctx.addIssue({
+          code: 'custom',
+          message:
+            'a secret value cannot hold a {{briq:…}} reference: put the address in a plain variable',
+        });
+    }),
 ]);
+// Zod 3 validates but drops own __proto__ record keys. Restore that accepted key
+// through an intersection, retaining the ordinary record schema for API documentation.
+export const EnvRecord = z
+  .record(EnvKey, EnvValue)
+  .superRefine((env, ctx) => {
+    // Boot bindings also become file paths; keep their existing portable-name restriction.
+    for (const [key, value] of Object.entries(env))
+      if (typeof value === 'object' && value.scope === 'boot' && !EnvName.safeParse(key).success)
+        ctx.addIssue({
+          code: 'custom',
+          path: [key],
+          message: 'boot secret bindings require a portable variable name',
+        });
+  })
+  .and(
+    z.unknown().transform((raw, ctx) => {
+      if (!raw || typeof raw !== 'object' || !Object.hasOwn(raw, '__proto__')) return {};
+      const parsed = EnvValue.safeParse(Object.getOwnPropertyDescriptor(raw, '__proto__')?.value);
+      if (!parsed.success) {
+        for (const issue of parsed.error.issues)
+          ctx.addIssue({ ...issue, path: ['__proto__', ...issue.path] });
+        return z.NEVER;
+      }
+      return Object.fromEntries([['__proto__', parsed.data]]);
+    }),
+  );
 export type EnvValue = z.infer<typeof EnvValue>;
 /** A secret in env, as a marker (`{ secret }`) or with its value. */
 export type EnvSecret = Exclude<EnvValue, string>;
@@ -247,29 +295,75 @@ export const fileBytes = (c: FileContent): number =>
 
 export const Healthcheck = z.object({
   cmd: Argv.min(1),
-  intervalMs: z.number().int().min(500).default(2000),
+  intervalMs: z.number().int().min(500).max(4_294_967_295_000).default(2000),
   // Per attempt, five minutes at most. A process still up when it runs out is waited for again,
   // three attempts in all, before the create fails.
   timeoutMs: z.number().int().min(1000).max(300_000).default(60_000),
 });
 
+/** Control-plane labels; never passed to the guest's environment or machine metadata. */
+const labelRecord = z.record(z.string().min(1).max(128), z.string().max(1024));
+// Zod 3 drops __proto__ while constructing a record. Inspect JSON's own keys
+// first, so accepted labels are never silently lost or excluded from the bound.
+const rawLabels = z.preprocess((value, ctx) => {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    if (Object.hasOwn(value, '__proto__'))
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: '__proto__ is not a supported label key',
+      });
+    if (Object.keys(value).length > 32)
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'at most 32 labels' });
+  }
+  return value;
+}, labelRecord) as z.ZodEffects<typeof labelRecord, Record<string, string>, Record<string, string>>;
+export const BriqLabels = rawLabels.refine(
+  (labels) => new TextEncoder().encode(JSON.stringify(labels)).length <= 16_384,
+  'labels must fit in 16 KiB of JSON',
+);
+
+/**
+ * Commands that let a running service be copied from memory. `park` runs before the copy is
+ * taken: it closes outbound connections and flushes files. `resume` runs in each copy before its
+ * program carries on: it opens connections again and renews anything unique to one instance.
+ * Both are argv arrays, run as the service's user in its environment. Not generally available.
+ */
+export const CloneHooks = z
+  .object({
+    park: Argv.min(1).describe('Run before the copy is taken, e.g. ["/app/park.sh"]'),
+    resume: Argv.min(1).describe('Run in each copy before its program carries on'),
+    parkTimeoutSeconds: z.number().int().min(1).max(300).optional().describe('Default 30'),
+    resumeTimeoutSeconds: z.number().int().min(1).max(300).optional().describe('Default 30'),
+  })
+  .strict();
+export type CloneHooks = z.infer<typeof CloneHooks>;
+
 export const BriqSpec = z.object({
   name: DnsName,
   image: ImageRef,
+  onExit: z
+    .enum(['retain', 'destroy'])
+    .optional()
+    .describe(
+      'Image runs without a healthcheck only: destroy after the main process finally exits following readiness. Default retain. Export outputs first: destruction removes disks and logs.',
+    ),
+  labels: BriqLabels.optional()
+    .transform((labels) => (labels && Object.keys(labels).length ? labels : undefined))
+    .describe(
+      'Optional control-plane labels: at most 32 pairs, keys 1–128 characters, values up to 1024 characters, 16 KiB JSON in all. Returned in status and lists; not secret',
+    ),
   cmd: Command.transform(toArgv)
     .optional()
     .describe(
       'The command: a string, run with sh -c ("npm start"), or the argv. Default: the image\'s',
     ),
   entrypoint: Argv.optional(),
-  env: z
-    .record(EnvName, EnvValue)
-    .refine((env) => Object.keys(env).length <= MAX_ENV_VARS, {
-      message: `at most ${MAX_ENV_VARS} environment variables`,
-    })
+  env: EnvRecord.refine((env) => Object.keys(env).length <= MAX_ENV_VARS, {
+    message: `at most ${MAX_ENV_VARS} environment variables`,
+  })
     .default({})
     .describe(
-      'A string; { secret: NAME } for a value briq generates; { secret: NAME, value } for a credential you have, stored encrypted and never returned. Plain values are shown in status. {{briq:NAME}} in a plain value becomes the address of briq NAME in the stack; {{self:host}}, the hostname of its own URL when it is published as it is created (localhost without one)',
+      'A string; { secret: NAME } for a value briq generates; { secret: NAME, value } for a credential you have, stored encrypted and never returned. literal: true on an unscoped secret preserves its exact value without interpolation. Plain values are shown in status. {{briq:NAME}} in a plain value becomes the address of briq NAME in the stack; {{self:host}}, the hostname of its own URL when it is published as it is created (localhost without one)',
     ),
   ports: z
     .array(z.number().int().min(1).max(65535))
@@ -278,6 +372,15 @@ export const BriqSpec = z.object({
     .describe('The ports the image listens on'),
   size: Size.default('small'),
   volume: VolumeSpec.optional(),
+  kvm: z
+    .boolean()
+    .optional()
+    .describe(
+      '/dev/kvm in the briq, to run a hypervisor of your own inside it. Every start is a cold boot: no memory is kept while it sleeps',
+    ),
+  cloneHooks: CloneHooks.optional().describe(
+    'Lets a template of this running service be sealed and copied from memory (POST /v1/briqs/{id}/templates). Not generally available',
+  ),
   /**
    * Files written into the briq before its process starts, path → content: an app's sources,
    * a config file. What a command that reads them needs from its first second, which a file
@@ -336,12 +439,9 @@ export const RecipeFields = z.object({
   image: ImageRef.optional().describe(
     "Another tag (postgres:17) or a compatible image (pgvector/pgvector:pg16). Default: the recipe's",
   ),
-  env: z
-    .record(EnvName, EnvValue)
-    .optional()
-    .describe(
-      "Added to the recipe's env, or replacing one of its values: a string, or { secret: NAME, value } for a credential",
-    ),
+  env: EnvRecord.optional().describe(
+    "Added to the recipe's env, or replacing one of its values: a string, or { secret: NAME, value } for a credential",
+  ),
   cmd: Command.optional().describe(
     'The command: a string run with sh -c ("npm start"), or the argv. A language recipe\'s start command',
   ),
@@ -408,6 +508,10 @@ export const EndpointProtocol = z.enum([
 export type EndpointProtocol = z.infer<typeof EndpointProtocol>;
 
 export const Endpoint = z.object({
+  primary: z
+    .boolean()
+    .optional()
+    .describe('HTTP only: true for the front-door URL, false for an additional URL'),
   id: z.string(),
   port: z.number().int(),
   protocol: EndpointProtocol.default('http').describe(
@@ -425,6 +529,9 @@ export const ERRORED_KEEP_DAYS = 7;
 
 export const Briq = z.object({
   id: z.string(),
+  labels: BriqLabels.default({}).describe(
+    'Control-plane labels; empty for historical specs. Not sent to the guest',
+  ),
   teamId: z.string(),
   stackId: z.string(),
   name: DnsName,
@@ -432,9 +539,7 @@ export const Briq = z.object({
   size: Size,
   state: BriqState,
   internalHost: z.string().describe("Its address on the team's private network"),
-  endpoints: z
-    .array(Endpoint)
-    .describe('Its URL, once published (one at most), and its TCP endpoint, once published'),
+  endpoints: z.array(Endpoint).describe('Its published HTTP URLs and TCP endpoints'),
   /** Ports the image listens on, as declared in the spec. */
   ports: z.array(z.number().int()).default([]),
   /** Database ports its recipe declares, and the protocol each speaks: what to pass `briq_expose`. */
@@ -445,18 +550,16 @@ export const Briq = z.object({
   /** The port meant to be reached from outside, when the spec names one. See `BriqSpec.expose`. */
   expose: z.number().int().nullable().default(null),
   /** Env as declared: plain values and `{ secret: NAME }` markers. Secret values never appear here. */
-  env: z
-    .record(EnvValue)
-    .default({})
-    .describe(
-      'As declared: plain values, and { secret: NAME } for secrets, whose values never appear',
-    ),
+  env: EnvRecord.default({}).describe(
+    'As declared: plain values, and { secret: NAME } for secrets, whose values never appear',
+  ),
   createdAt: z.string().datetime(),
   startedAt: z
     .string()
     .datetime()
     .nullable()
     .describe('When its current run started (its last run, while it is not running)'),
+  onExit: z.enum(['retain', 'destroy']).optional(),
   sleep: Sleep,
   sleepsAt: z
     .string()
@@ -495,6 +598,14 @@ export const Briq = z.object({
     .describe('Its boot files, by path and size; their content is not returned'),
   /** The briq this one was forked from, when it is a fork. See `ForkCopy`. */
   forkedFrom: z.string().nullable().default(null),
+  /** Where it was placed: a region id, null until it is. Can differ from the team's preferred region. */
+  region: z
+    .string()
+    .nullable()
+    .default(null)
+    .describe(
+      "Where it was placed, a region id from GET /v1/me. Null until it is placed. Can differ from the team's preferred region when that one had no capacity",
+    ),
   /** Its volume, when it has one: kept until the briq is destroyed, grown by a resize. */
   volume: z
     .object({ mount: z.string(), gb: z.number().int() })
