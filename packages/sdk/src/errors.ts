@@ -9,6 +9,8 @@ export class BriqApiError extends Error {
     readonly requestId?: string,
     /** The answer is a stored one, sent again for a repeated `Idempotency-Key`: sending it again gives the same. */
     readonly replayed = false,
+    /** The seconds the API asked to wait before trying again (`Retry-After`), when it did. */
+    readonly retryAfterSeconds?: number,
   ) {
     super(message);
   }

@@ -37,6 +37,19 @@ Every method maps to one endpoint of the [REST API](https://briq.cloud/docs/api/
 creates briqs carries an `Idempotency-Key` and is sent again after a network error or a 502, 503
 or 504, so it makes its briqs once.
 
+### One sandbox
+
+```ts
+const briq = new Briq(process.env.BRIQ_API_KEY!);
+const { sandbox } = await briq.sandboxStatus('bq_example');
+const result = await briq.exec(sandbox.id, ['echo', 'hello']);
+```
+
+Set `BRIQ_API_KEY` to the `bq_sbox_…` credential.
+Where enabled, it permits safe status, commands, command results/cancellation and files for its exact ID.
+Commands and files may wake that sandbox and start billable runtime. Use `sandboxStatus`, not full `status` or `nativeSandbox`.
+It cannot create resources, read quota or manage credentials. See the [support matrix](https://briq.cloud/docs/concepts/keys-and-policy#one-sandbox).
+
 ## Errors
 
 `create` takes a `size` for that sandbox: `'small'` (the default), `'medium'`, `'large'` or `'xlarge'`
@@ -113,9 +126,18 @@ A server that does not return access leaves the first `exec` to ask as before.
 
 With the standard transport, the client reserves up to four command admissions and reuses them
 in memory until exhausted or expired. Set `execution.maxCommands` to 1 to disable reuse, or to
-an integer up to 16. Unused reservations expire. Each client keeps at most 64 descriptors;
+an integer up to 16. Unused reservations expire. Each client keeps at most 1024 descriptors;
 credentials never go to disk. A custom control transport defaults to one command; reserve more
 only when its credential and team context remain fixed for the lifetime of that client.
+
+Asking for access is safe to repeat, since no command has been sent: after a transport error, a
+429, 502, 503 or 504 the client asks again (3 attempts in all, waiting 250 ms then 1 s, or the
+`Retry-After` when it is at most 5 s). It never runs a command through the API because the
+answer is slow. It does so when regional access is not available: the briq has no regional route
+(`no_regional_route`, remembered for 10 minutes), the request is refused, or the retries fail
+(remembered for 5 s). A command whose connection to the regional origin was refused or not
+resolved runs through the API; once its request may have left, it is never sent again and fails
+with `outcome_unknown`.
 
 With a custom control `fetch`, supply a separate `execution.fetch` to use regional access.
 Otherwise commands use the API route. Keep control credentials out of the

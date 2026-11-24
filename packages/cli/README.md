@@ -34,6 +34,18 @@ It prints the briq, its connection strings (`DATABASE_URL`, `PGHOST`…) and wha
 far. The database sleeps after two hours without use, and wakes on the next call with its data.
 `briq catalog` lists the recipes.
 
+For a standalone sandbox, `--egress-host` restricts outbound HTTPS on port 443 to exact hostnames;
+repeat it for each host. Use `--egress-deny-all` to block all outbound connections.
+The two options cannot be combined. Unsupported environments refuse the run.
+
+```bash
+briq run node --egress-host api.example.com --egress-host registry.npmjs.org
+briq run node --egress-deny-all
+```
+
+Restricted sandboxes are created fresh. Seed or warm-pool starts, forks, templates and backup restores are unsupported.
+Stop, start, wake, resize and suspend keep the policy.
+
 ## Commands
 
 | Command | What it does |
@@ -57,7 +69,7 @@ far. The database sleeps after two hours without use, and wakes on the next call
 | `briq secrets` | The team's secrets: names and hosts, never a value |
 | `briq feedback <topic> <message>` | Write to the briq team: `bug`, `idea` or `question` |
 
-A `<briq>` is an id, such as `bq_7kq2m9x1p4ab`. `--json` on any command prints the API's response.
+A `<briq>` is an id, such as `bq_7kq2m9x1p4ab`, or the name of one of your briqs (a name two stacks share is refused: use the id; a sandbox credential uses the exact id). `--json` on any command prints the API's response.
 Each command is an [MCP tool](https://briq.cloud/docs/mcp/tools) with the same options: `briq exec`
 is `briq_exec`. Every option is in the [CLI reference](https://briq.cloud/docs/cli).
 

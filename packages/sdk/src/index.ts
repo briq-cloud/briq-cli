@@ -6,6 +6,7 @@ import type {
   ForkCopy,
   KeyPolicy,
   RecipeFields,
+  SandboxStatus,
   Size,
   SupportTopic,
   TeamSecretIn,
@@ -13,9 +14,14 @@ import type {
   TeamSecretUpdate,
 } from '@briq/public';
 import { BriqApiError } from './errors.js';
-import { type ExecutionOptions, ExecutionRouter, unknownOutcome } from './execution.js';
+import {
+  type ExecutionOptions,
+  ExecutionRouter,
+  RegionalNotReached,
+  unknownOutcome,
+} from './execution.js';
 
-export type { BriqRecord, BriqSpecInput, ForkCopy, KeyPolicy, RecipeFields };
+export type { BriqRecord, BriqSpecInput, ForkCopy, KeyPolicy, RecipeFields, SandboxStatus };
 export { BriqApiError };
 export type { ExecutionOptions };
 
@@ -153,7 +159,11 @@ export interface LogLine {
 }
 export interface Quota {
   /** Absent on older APIs. Require each feature before using labels or literal secret inputs. */
-  features?: { briqLabels?: boolean; literalEnvSecrets?: boolean };
+  features?: {
+    briqLabels?: boolean;
+    literalEnvSecrets?: boolean;
+    sandboxScopedCredentials?: boolean;
+  };
   /** Sizes this credential may run here; absent from an older API. */
   availableSizes?: Size[];
   plan: string;
@@ -244,6 +254,14 @@ export type RunInput =
  * tool arguments; unencoded, `../keys` as a briq id asked for another route altogether.
  */
 const seg = (value: string) => encodeURIComponent(value);
+/** `Retry-After` as seconds (a number, or a date), when the API sent one. */
+function retryAfterSeconds(header: string | null): number | undefined {
+  if (!header) return undefined;
+  const seconds = /^\d+$/.test(header.trim())
+    ? Number(header)
+    : (Date.parse(header) - Date.now()) / 1000;
+  return Number.isFinite(seconds) ? Math.max(0, Math.ceil(seconds)) : undefined;
+}
 
 /** What a call that creates briqs takes beside its input. */
 export interface CreateOptions {
@@ -334,6 +352,7 @@ export class Briq {
       e.details,
       res.headers.get('x-request-id') ?? e.requestId ?? undefined,
       res.headers.get('idempotent-replayed') === 'true',
+      retryAfterSeconds(res.headers.get('retry-after')),
     );
   }
 
@@ -462,6 +481,12 @@ export class Briq {
   status(id: string) {
     return this.call<{ briq: BriqRecord; costLine: string }>('GET', `/v1/briqs/${seg(id)}`);
   }
+  sandboxStatus(id: string) {
+    return this.call<{ sandbox: SandboxStatus; costLine: string }>(
+      'GET',
+      `/v1/briqs/${seg(id)}/status`,
+    );
+  }
   /** An authenticated terminal handshake for a Node WebSocket client. Never put its headers in a URL. */
   shellHandshake(id: string, opts: { cols?: number; rows?: number; term?: string } = {}) {
     const url = new URL(`${this.baseUrl}/v1/briqs/${seg(id)}/shell`);
@@ -492,7 +517,14 @@ export class Briq {
       this.executionAccess(id, maxCommands),
     );
     if (!access) return this.call<ExecResult>('POST', path, body);
-    const res = await this.execution.send(access, path, body);
+    let res: Response;
+    try {
+      res = await this.execution.send(access, path, body);
+    } catch (error) {
+      // The regional origin could not be connected to: nothing was sent, the API runs it.
+      if (error instanceof RegionalNotReached) return this.call<ExecResult>('POST', path, body);
+      throw error;
+    }
     // A status alone is not proof of no dispatch. No versioned pre-dispatch refusal
     // contract is advertised yet, so every non-success regional response is uncertain.
     if (!res.ok) {
@@ -819,6 +851,7 @@ export class Briq {
         id: string;
         name: string;
         prefix: string;
+        sandboxId: string | null;
         policy: KeyPolicy;
         createdAt: string;
         revokedAt: string | null;

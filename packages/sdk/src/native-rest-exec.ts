@@ -1,4 +1,5 @@
 import { BriqApiError } from './errors.js';
+import { RegionalNotReached, neverConnected } from './execution.js';
 import { type Command, type CommandResult, bytes, validate } from './native-command.js';
 import { BriqOperationError, fail, refusal, statusCode } from './native-errors.js';
 
@@ -79,20 +80,6 @@ export const inDir = (input: Command) => [
   ...input.cmd,
 ];
 
-/** What undici reports when no connection was made, so nothing of the command was sent. */
-const NEVER_CONNECTED = new Set([
-  'ECONNREFUSED',
-  'ENOTFOUND',
-  'EAI_AGAIN',
-  'ENETUNREACH',
-  'EHOSTUNREACH',
-  'UND_ERR_CONNECT_TIMEOUT',
-]);
-const neverSent = (error: unknown) => {
-  const code = (error as { cause?: { code?: unknown } } | null)?.cause?.code;
-  return typeof code === 'string' && NEVER_CONNECTED.has(code);
-};
-
 /** The body as text, at most `limit` bytes of it: past that the read stops and says so. */
 async function readLimited(res: Response, limit: number): Promise<string | undefined> {
   if (!res.body) return '';
@@ -171,24 +158,32 @@ export async function runHttp(
   };
   let res: Response;
   try {
+    const central = () =>
+      fetcher(`${base}/v1/briqs/${encodeURIComponent(id)}/exec`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${key}`,
+          'content-type': 'application/json',
+          accept: 'application/json',
+        },
+        body: JSON.stringify(body),
+        // A deadline for this call, past the command's own: the shared client's 30 s would cut a
+        // command that has 60.
+        signal: AbortSignal.timeout(input.timeoutMs + ROUND_TRIP_MS),
+      });
     res = regional
-      ? await regional.send(body)
-      : await fetcher(`${base}/v1/briqs/${encodeURIComponent(id)}/exec`, {
-          method: 'POST',
-          headers: {
-            authorization: `Bearer ${key}`,
-            'content-type': 'application/json',
-            accept: 'application/json',
-          },
-          body: JSON.stringify(body),
-          // A deadline for this call, past the command's own: the shared client's 30 s would cut a
-          // command that has 60.
-          signal: AbortSignal.timeout(input.timeoutMs + ROUND_TRIP_MS),
-        });
+      ? // The regional origin could not be connected to: nothing was sent, the API runs it.
+        await regional.send(body).catch((error: unknown) => {
+          if (error instanceof RegionalNotReached) return central();
+          throw error;
+        })
+      : await central();
   } catch (error) {
     if (regional && error instanceof BriqApiError && error.code === 'regional_unavailable')
       throw fail('unavailable', 'Regional command access expired before dispatch');
-    throw neverSent(error) ? fail('unavailable', 'Briq command stream unavailable') : unconfirmed();
+    throw neverConnected(error)
+      ? fail('unavailable', 'Briq command stream unavailable')
+      : unconfirmed();
   }
   if (!res.ok && regional) {
     // No regional status currently proves that the command was never dispatched.

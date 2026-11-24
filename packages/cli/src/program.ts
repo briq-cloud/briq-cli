@@ -23,6 +23,7 @@ import {
 import { writeEnv } from './envfile.js';
 import { CliError, EXIT, notSignedIn, usage } from './errors.js';
 import { discover, pollForTokens, register, requestCode } from './oauth.js';
+import { resolveBriq } from './resolve.js';
 import { type RunFlags, kv, mode, runInput } from './run-input.js';
 import { VERSION, cliFetch, openSession } from './session.js';
 import { runShell } from './shell.js';
@@ -295,6 +296,12 @@ program
   .option('--path <dir>', "the checkout's directory inside the repo")
   .option('--token <NAME>', 'a private repo: the secret holding its token, read from $NAME')
   .option('--step <command...>', 'a language recipe: a command run before it starts, in order')
+  .option(
+    '--egress-host <hostname>',
+    'allow outbound HTTPS to this exact hostname (repeatable; conflicts with --egress-deny-all)',
+    (hostname: string, hosts: string[] = []) => [...hosts, hostname],
+  )
+  .option('--egress-deny-all', 'deny all outbound connections (conflicts with --egress-host)')
   .option('--no-wait', 'return before the briq is ready')
   .action(
     run(async (target: string, o: RunFlags) => {
@@ -335,7 +342,8 @@ program
   .argument('<briq>')
   .action(
     run(async (id: string) => {
-      const r = await (await client()).status(id);
+      const c = await client();
+      const r = await c.status(await resolveBriq(c, id));
       out(r, () => `${fmtBriq(r.briq)}\n${pc.dim(r.costLine)}`);
     }),
   );
@@ -363,7 +371,7 @@ program
         throw usage('briq shell needs an interactive terminal; use briq exec for scripts');
       const { client: c } = await openSession();
       process.exitCode = await runShell(
-        c.shellHandshake(id, {
+        c.shellHandshake(await resolveBriq(c, id), {
           cols: Math.min(1000, Math.max(1, process.stdout.columns || 80)),
           rows: Math.min(1000, Math.max(1, process.stdout.rows || 24)),
           term: process.env.TERM || 'xterm',
@@ -406,6 +414,7 @@ program
         const c = (await openSession()).client;
         const timeoutMs = int(o.timeout, '--timeout');
         if (o.stdinOpen && !o.async) throw usage('--stdin-open needs --async');
+        const briq = await resolveBriq(c, id);
         const opts = {
           ...(timeoutMs !== undefined ? { timeoutMs } : {}),
           ...(o.stdin ? { stdin: (await readStdin()).toString('utf8') } : {}),
@@ -413,16 +422,16 @@ program
           ...(o.clearEnv ? { clearEnv: true } : {}),
         };
         if (o.async) {
-          const r = await c.execAsync(id, cmd, {
+          const r = await c.execAsync(briq, cmd, {
             ...opts,
             ...(o.stdinOpen ? { stdinOpen: true } : {}),
           });
           return out(
             r,
-            () => `${execLine(r.exec)}\n${pc.dim(`briq exec-result ${id} ${r.exec.id}`)}`,
+            () => `${execLine(r.exec)}\n${pc.dim(`briq exec-result ${briq} ${r.exec.id}`)}`,
           );
         }
-        const r = await c.exec(id, cmd, opts);
+        const r = await c.exec(briq, cmd, opts);
         if (json()) console.log(JSON.stringify(r, null, 2));
         else {
           process.stdout.write(r.stdout);
@@ -455,7 +464,8 @@ program
         const maxBytes = int(o.maxBytes, '--max-bytes');
         if (o.stream !== undefined && o.stream !== 'stdout' && o.stream !== 'stderr')
           throw usage(`--stream is stdout or stderr, got "${o.stream}"`);
-        const r = await (await client()).execStatus(id, execId, {
+        const c = await client();
+        const r = await c.execStatus(await resolveBriq(c, id), execId, {
           ...(waitMs !== undefined ? { waitMs } : {}),
           ...(offset !== undefined ? { offset } : {}),
           ...(o.stream ? { stream: o.stream } : {}),
@@ -505,7 +515,8 @@ program
             : text !== undefined
               ? { data: text }
               : {};
-        const r = await (await client()).execInput(id, execId, {
+        const c = await client();
+        const r = await c.execInput(await resolveBriq(c, id), execId, {
           ...data,
           ...(o.eof ? { eof: true } : {}),
           ...(seq !== undefined ? { seq } : {}),
@@ -526,7 +537,8 @@ program
   .argument('<exec>')
   .action(
     run(async (id: string, execId: string) => {
-      const r = await (await client()).execStop(id, execId);
+      const c = await client();
+      const r = await c.execStop(await resolveBriq(c, id), execId);
       out(r, () => execLine(r.exec));
     }),
   );
@@ -540,7 +552,8 @@ program
   .action(
     run(async (id: string, o: { limit?: string; since?: string }) => {
       const limit = int(o.limit, '--limit');
-      const r = await (await client()).logs(id, {
+      const c = await client();
+      const r = await c.logs(await resolveBriq(c, id), {
         ...(limit !== undefined ? { limit } : {}),
         ...(o.since ? { since: o.since } : {}),
       });
@@ -565,8 +578,9 @@ program
     run(async (id: string, path: string, file: string | undefined) => {
       if (!file && process.stdin.isTTY) throw usage('pass a local file, or pipe the content');
       const source = file ? createReadStream(file) : process.stdin;
-      const r = await (await client()).putFileBytes(
-        id,
+      const c = await client();
+      const r = await c.putFileBytes(
+        await resolveBriq(c, id),
         path,
         Readable.toWeb(source) as ReadableStream<Uint8Array>,
       );
@@ -589,8 +603,9 @@ program
   .action(
     run(async (id: string, path: string, o: { out?: string }) => {
       const c = await client();
-      if (json()) return console.log(JSON.stringify(await c.getFile(id, path), null, 2));
-      const body = Readable.fromWeb((await c.getFileStream(id, path)) as never);
+      const briq = await resolveBriq(c, id);
+      if (json()) return console.log(JSON.stringify(await c.getFile(briq, path), null, 2));
+      const body = Readable.fromWeb((await c.getFileStream(briq, path)) as never);
       if (o.out) {
         let bytes = 0;
         body.on('data', (part: Buffer) => {
@@ -622,7 +637,10 @@ program
         port: string,
         o: { mode?: string; protocol?: string; rotate?: boolean; additional?: boolean },
       ) => {
-        const r = await (await client()).expose(id, int(port, 'port') as number, mode(o.mode), {
+        const portNumber = int(port, 'port') as number;
+        const exposeMode = mode(o.mode);
+        const c = await client();
+        const r = await c.expose(await resolveBriq(c, id), portNumber, exposeMode, {
           rotate: o.rotate === true,
           additional: o.additional === true,
           ...(o.protocol ? { protocol: o.protocol as EndpointProtocol } : {}),
@@ -641,7 +659,8 @@ program
   .argument('<endpoint>')
   .action(
     run(async (id: string, endpoint: string) => {
-      const r = await (await client()).unexpose(id, endpoint);
+      const c = await client();
+      const r = await c.unexpose(await resolveBriq(c, id), endpoint);
       out(r, () => (r.removed ? 'URL removed' : 'URL already absent'));
     }),
   );
@@ -703,7 +722,7 @@ program
           ...(o.sleep ? { sleep: o.sleep } : {}),
         };
         const res = id
-          ? await c.fork(id, {
+          ? await c.fork(await resolveBriq(c, id), {
               ...(o.cmd === undefined ? {} : { cmd: o.cmd }),
               ...common,
               ...(o.name ? { name: o.name } : {}),
@@ -750,11 +769,11 @@ for (const a of ['stop', 'start'] as const) {
       const c = await client();
       const r =
         a === 'stop'
-          ? await c.stop(id, {
+          ? await c.stop(await resolveBriq(c, id), {
               ...(opts.cold ? { mode: 'cold' as const } : {}),
               ...(opts.wait === false ? { wait: false } : {}),
             })
-          : await c.start(id);
+          : await c.start(await resolveBriq(c, id));
       out(r, () => fmtBriq(r.briq));
     }),
   );
@@ -777,7 +796,10 @@ program
         const r = await c.destroyStack(stack, o.wait === false ? { wait: false } : {});
         return out(r, () => [`stack ${r.stack.name}`].concat(r.briqs.map(fmtBriq)).join('\n'));
       }
-      const r = await c.destroy(id as string, o.wait === false ? { wait: false } : {});
+      const r = await c.destroy(
+        await resolveBriq(c, id as string),
+        o.wait === false ? { wait: false } : {},
+      );
       out(r, () => fmtBriq(r.briq));
     }),
   );
@@ -790,7 +812,8 @@ program
   .option('--stack', 'the same for every briq of its stack')
   .action(
     run(async (id: string, sleep: string, o: { stack?: boolean }) => {
-      const r = await (await client()).setSleep(id, sleep, o.stack ? { stack: true } : {});
+      const c = await client();
+      const r = await c.setSleep(await resolveBriq(c, id), sleep, o.stack ? { stack: true } : {});
       out(r, () => r.briqs.map(fmtBriq).join('\n'));
     }),
   );
@@ -836,7 +859,8 @@ program
         const gb = o.volumeGb === undefined ? undefined : Number(o.volumeGb);
         if (gb !== undefined && !Number.isInteger(gb))
           throw usage('--volume-gb takes a whole number');
-        const r = await (await client()).resize(id, {
+        const c = await client();
+        const r = await c.resize(await resolveBriq(c, id), {
           ...(o.image === undefined ? {} : { image: o.image }),
           ...(healthcheck === undefined ? {} : { healthcheck }),
           ...(o.size ? { size: o.size as Size } : {}),
@@ -857,7 +881,8 @@ program
   .action(
     run(async (id: string, stack: string | undefined, o: { out?: boolean }) => {
       if (!stack === !o.out) throw usage('pass a stack, or --out');
-      const r = await (await client()).move(id, o.out ? null : (stack as string));
+      const c = await client();
+      const r = await c.move(await resolveBriq(c, id), o.out ? null : (stack as string));
       out(
         r,
         () =>

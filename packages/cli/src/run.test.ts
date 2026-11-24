@@ -61,4 +61,29 @@ describe('briq run', () => {
     expect(() => runInput('redis', { volume: '/x', wait: true })).toThrow(/image/);
     expect(() => runInput('node', { ref: 'main', wait: true })).toThrow(/--checkout/);
   });
+
+  it('forwards validated egress policy on images and recipes, including deny-all', () => {
+    expect(
+      runInput('nginx:1.27', {
+        egressHost: ['API.Example.com', 'cdn.example.com'],
+        wait: true,
+      }),
+    ).toEqual({
+      spec: {
+        name: 'nginx',
+        image: 'nginx:1.27',
+        egress: { hosts: ['api.example.com', 'cdn.example.com'] },
+      },
+      wait: true,
+    });
+    expect(runInput('node', { egressDenyAll: true, wait: true })).toEqual({
+      recipe: 'node',
+      egress: { hosts: [] },
+      wait: true,
+    });
+    expect(() => runInput('node', { egressHost: ['bad host'], wait: true })).toThrow();
+    expect(() =>
+      runInput('node', { egressHost: ['example.com'], egressDenyAll: true, wait: true }),
+    ).toThrow(/cannot be used together/);
+  });
 });

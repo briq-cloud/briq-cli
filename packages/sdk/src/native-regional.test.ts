@@ -143,6 +143,24 @@ it('falls back only during supported discovery failures before dispatch', async 
   expect(f.regional).not.toHaveBeenCalled();
   expect(f.control.mock.calls.filter(([url]) => String(url).endsWith('/exec'))).toHaveLength(1);
 });
+it('runs the command through the API when the regional origin cannot be connected to, and only then', async () => {
+  const f = fixture();
+  const centralRuns = () =>
+    f.control.mock.calls.filter(([url]) => String(url).endsWith('/exec')).length;
+  f.regional.mockRejectedValueOnce(
+    Object.assign(new TypeError('fetch failed'), { cause: { code: 'ENOTFOUND' } }),
+  );
+  await expect(f.client.run('bq_owned', command())).resolves.toBeDefined();
+  expect(f.regional).toHaveBeenCalledTimes(1);
+  expect(centralRuns()).toBe(1);
+  // A failure after the connection was made is never repeated through the API.
+  const g = fixture();
+  g.regional.mockRejectedValueOnce(
+    Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } }),
+  );
+  await expect(g.client.run('bq_owned', command())).rejects.toBeDefined();
+  expect(g.control.mock.calls.filter(([url]) => String(url).endsWith('/exec'))).toHaveLength(0);
+});
 it('sends the negotiated request once over a real loopback HTTP execution transport', async () => {
   const received: Array<{
     authorization: string | undefined;

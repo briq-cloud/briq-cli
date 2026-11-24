@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { EgressPolicy } from './egress.js';
 import { refsIn } from './refs.js';
 import { Size } from './sizes.js';
 import { Sleep } from './sleep.js';
@@ -341,6 +342,7 @@ export type CloneHooks = z.infer<typeof CloneHooks>;
 export const BriqSpec = z.object({
   name: DnsName,
   image: ImageRef,
+  egress: EgressPolicy.optional(),
   onExit: z
     .enum(['retain', 'destroy'])
     .optional()
@@ -436,6 +438,7 @@ export type BriqSpecInput = z.input<typeof BriqSpec>;
  * (`GET /v1/recipes/{name}`); this shape is what the API and MCP describe.
  */
 export const RecipeFields = z.object({
+  egress: EgressPolicy.optional(),
   image: ImageRef.optional().describe(
     "Another tag (postgres:17) or a compatible image (pgvector/pgvector:pg16). Default: the recipe's",
   ),

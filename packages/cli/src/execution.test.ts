@@ -35,8 +35,10 @@ it('falls back to the API when access is unsupported, and preserves command opti
     res.setHeader('content-type', 'application/json');
     if (req.url?.endsWith('/access')) {
       res
-        .writeHead(503)
-        .end(JSON.stringify({ error: { code: 'provider_error', message: 'unavailable' } }));
+        .writeHead(404)
+        .end(
+          JSON.stringify({ error: { code: 'no_regional_route', message: 'no regional route' } }),
+        );
     } else {
       res.end(
         JSON.stringify({
@@ -115,6 +117,56 @@ it('asks a create for command access, and prints none if the API sends it', asyn
     expect(bodies).toHaveLength(1);
     expect(bodies[0]).toMatchObject({ access: { version: 1, operations: ['exec'] } });
     expect(run.stdout + run.stderr).not.toContain('secret-execution-grant');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
+it('forwards recipe allowlists and image deny-all through the HTTP API', async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const server = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    bodies.push(JSON.parse(Buffer.concat(chunks).toString()));
+    res.setHeader('content-type', 'application/json');
+    res.writeHead(201).end(JSON.stringify({ briqs: [], outputs: {}, costLine: 'cost' }));
+  });
+  try {
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('missing listener');
+    const env = {
+      ...process.env,
+      BRIQ_API_KEY: 'test-key',
+      BRIQ_API_URL: `http://127.0.0.1:${address.port}`,
+      BRIQ_CONFIG_DIR: '/dev/null',
+    };
+    await execute(
+      process.execPath,
+      [
+        cli,
+        'run',
+        'node',
+        '--egress-host',
+        'API.Example.com',
+        '--egress-host',
+        'registry.npmjs.org',
+      ],
+      { timeout: 5000, env },
+    );
+    await execute(process.execPath, [cli, 'run', 'alpine:3', '--egress-deny-all'], {
+      timeout: 5000,
+      env,
+    });
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).toMatchObject({
+      recipe: 'node',
+      egress: { hosts: ['api.example.com', 'registry.npmjs.org'] },
+    });
+    expect(bodies[1]).toMatchObject({ spec: { egress: { hosts: [] } } });
   } finally {
     server.closeAllConnections();
     await new Promise<void>((resolve, reject) =>

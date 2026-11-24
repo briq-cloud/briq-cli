@@ -88,6 +88,21 @@ describe('Briq client', () => {
     });
   });
   it.each([
+    { spec: { image: 'alpine:3', egress: { hosts: [] } } },
+    { recipe: 'node', egress: { hosts: ['api.example.com'] } },
+  ])('forwards run egress policy unchanged: %j', async (input) => {
+    let body: unknown;
+    const c = new Briq('k', {
+      baseUrl: 'http://api.test',
+      fetch: fakeFetch((_url, init) => {
+        body = JSON.parse(String(init.body));
+        return { status: 200, body: { briqs: [], outputs: {}, costLine: 'c' } };
+      }),
+    });
+    await c.run(input);
+    expect(body).toEqual(input);
+  });
+  it.each([
     { image: 'ubuntu:24.04' },
     { healthcheck: null },
     { image: 'ubuntu:24.04', healthcheck: { cmd: ['true'] } },

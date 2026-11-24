@@ -94,7 +94,7 @@ describe('synchronous execution routing', () => {
     expect(external).not.toHaveBeenCalled();
   });
 
-  it.each([404, 405, 501, 503])(
+  it.each([404, 405, 501])(
     'falls back to the API route before dispatch on unsupported discovery (%s)',
     async (status) => {
       const control = vi
@@ -113,22 +113,232 @@ describe('synchronous execution routing', () => {
     },
   );
 
-  it.each([401, 402, 403, 409, 429])(
-    'does not bypass an admission refusal (%s)',
+  it.each([401, 402, 403, 409, 500])(
+    'runs the command through the API when discovery is refused (%s), and does not ask again at once',
     async (status) => {
       const control = vi
         .fn<typeof fetch>()
-        .mockImplementation(async () => error(status, 'refused'));
+        .mockImplementation(async (url) =>
+          String(url).endsWith('/access') ? error(status, 'refused') : json(result),
+        );
       const execution = vi.fn<typeof fetch>();
-      await expect(
-        new Briq('key', { fetch: control, execution: { fetch: execution } }).exec('bq_one', [
-          'true',
-        ]),
-      ).rejects.toMatchObject({ status });
-      expect(control).toHaveBeenCalledTimes(1);
+      const briq = new Briq('key', { fetch: control, execution: { fetch: execution } });
+      await expect(briq.exec('bq_one', ['true'])).resolves.toEqual(result);
+      await expect(briq.exec('bq_one', ['true'])).resolves.toEqual(result);
+      const paths = control.mock.calls.map(([url]) => String(url).replace(/^.*\/v1/, ''));
+      expect(paths.filter((p) => p.endsWith('/access'))).toHaveLength(1);
+      expect(paths.filter((p) => p.endsWith('/exec'))).toHaveLength(2);
       expect(execution).not.toHaveBeenCalled();
     },
   );
+
+  describe('discovery waits, retries and falls back only when regional access is not available', () => {
+    const control = (onAccess: (n: number) => Promise<Response> | Response) => {
+      let accesses = 0;
+      return vi.fn<typeof fetch>().mockImplementation(async (url) => {
+        if (!String(url).endsWith('/access')) return json(result);
+        return onAccess(++accesses);
+      });
+    };
+    const calls = (fn: ReturnType<typeof vi.fn<typeof fetch>>, suffix: string) =>
+      fn.mock.calls.filter(([url]) => String(url).endsWith(suffix)).length;
+    const withTimers = async (body: () => Promise<void>) => {
+      vi.useFakeTimers();
+      try {
+        await body();
+      } finally {
+        vi.useRealTimers();
+      }
+    };
+    const refused = (status: number, headers: Record<string, string> = {}) =>
+      new Response(JSON.stringify({ error: { code: 'provider_error', message: 'no' } }), {
+        status,
+        headers,
+      });
+
+    it('never goes through the API because discovery is slow', async () => {
+      await withTimers(async () => {
+        let answer!: (r: Response) => void;
+        const fn = control(
+          () =>
+            new Promise<Response>((resolve) => {
+              answer = resolve;
+            }),
+        );
+        const execution = vi.fn<typeof fetch>().mockImplementation(async () => json(result));
+        const run = new Briq('key', { fetch: fn, execution: { fetch: execution } }).exec('bq_one', [
+          'true',
+        ]);
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(calls(fn, '/exec')).toBe(0);
+        expect(calls(fn, '/access')).toBe(1);
+        answer(json(descriptor()));
+        await expect(run).resolves.toEqual(result);
+        expect(execution).toHaveBeenCalledTimes(1);
+        expect(calls(fn, '/exec')).toBe(0);
+      });
+    });
+
+    it.each([
+      ['a 503', () => refused(503)],
+      ['a 429', () => refused(429)],
+      [
+        'a refused connection',
+        () => {
+          throw new TypeError('fetch failed', { cause: { code: 'ECONNREFUSED' } });
+        },
+      ],
+    ])('retries discovery after %s and leaves no cooldown once it succeeds', async (_, fail) => {
+      await withTimers(async () => {
+        const fn = control((n) => (n < 3 ? fail() : json(descriptor())));
+        const execution = vi.fn<typeof fetch>().mockImplementation(async () => json(result));
+        const briq = new Briq('key', { fetch: fn, execution: { fetch: execution } });
+        const first = briq.exec('bq_one', ['true']);
+        // 250 ms, then 1 s, between the three attempts.
+        await vi.advanceTimersByTimeAsync(250);
+        expect(calls(fn, '/access')).toBe(2);
+        await vi.advanceTimersByTimeAsync(1000);
+        await expect(first).resolves.toEqual(result);
+        expect(calls(fn, '/access')).toBe(3);
+        expect(execution).toHaveBeenCalledTimes(1);
+        expect(calls(fn, '/exec')).toBe(0);
+        // No cooldown: the next command asks for regional access at once.
+        await briq.exec('bq_one', ['true']);
+        expect(calls(fn, '/access')).toBe(4);
+        expect(execution).toHaveBeenCalledTimes(2);
+      });
+    });
+
+    it.each([
+      ['a 502', () => refused(502)],
+      ['a 504', () => refused(504)],
+      [
+        'a lost answer',
+        () => {
+          throw new TypeError('fetch failed', { cause: { code: 'UND_ERR_SOCKET' } });
+        },
+      ],
+    ])('never repeats discovery after %s, which may have issued a grant', async (_, fail) => {
+      await withTimers(async () => {
+        const fn = control(() => fail());
+        const execution = vi.fn<typeof fetch>().mockImplementation(async () => json(result));
+        await expect(
+          new Briq('key', { fetch: fn, execution: { fetch: execution } }).exec('bq_one', ['true']),
+        ).resolves.toEqual(result);
+        expect(calls(fn, '/access')).toBe(1);
+        expect(calls(fn, '/exec')).toBe(1);
+        expect(execution).not.toHaveBeenCalled();
+      });
+    });
+
+    it('honours Retry-After, and goes through the API when it is longer than the cap', async () => {
+      await withTimers(async () => {
+        const fn = control((n) =>
+          n === 1 ? refused(429, { 'retry-after': '3' }) : json(descriptor()),
+        );
+        const execution = vi.fn<typeof fetch>().mockImplementation(async () => json(result));
+        const run = new Briq('key', { fetch: fn, execution: { fetch: execution } }).exec('bq_one', [
+          'true',
+        ]);
+        await vi.advanceTimersByTimeAsync(2900);
+        expect(calls(fn, '/access')).toBe(1);
+        await vi.advanceTimersByTimeAsync(200);
+        await expect(run).resolves.toEqual(result);
+        expect(calls(fn, '/access')).toBe(2);
+        expect(execution).toHaveBeenCalledTimes(1);
+
+        const long = control(() => refused(429, { 'retry-after': '60' }));
+        await expect(
+          new Briq('key', { fetch: long, execution: { fetch: execution } }).exec('bq_one', [
+            'true',
+          ]),
+        ).resolves.toEqual(result);
+        expect(calls(long, '/access')).toBe(1);
+        expect(calls(long, '/exec')).toBe(1);
+      });
+    });
+
+    it('goes through the API once the retries are spent, and holds off briefly', async () => {
+      await withTimers(async () => {
+        const fn = control(() => refused(503));
+        const execution = vi.fn<typeof fetch>();
+        const briq = new Briq('key', { fetch: fn, execution: { fetch: execution } });
+        const first = briq.exec('bq_one', ['true']);
+        await vi.advanceTimersByTimeAsync(1250);
+        await expect(first).resolves.toEqual(result);
+        expect(calls(fn, '/access')).toBe(3);
+        expect(calls(fn, '/exec')).toBe(1);
+        await expect(briq.exec('bq_one', ['true'])).resolves.toEqual(result);
+        expect(calls(fn, '/access')).toBe(3);
+        await vi.advanceTimersByTimeAsync(5000);
+        const again = briq.exec('bq_one', ['true']);
+        await vi.advanceTimersByTimeAsync(1250);
+        await again;
+        expect(calls(fn, '/access')).toBe(6);
+        expect(execution).not.toHaveBeenCalled();
+      });
+    });
+
+    it('goes through the API at once on no_regional_route and remembers it for a long time', async () => {
+      await withTimers(async () => {
+        const fn = control(() => error(404, 'no_regional_route'));
+        const execution = vi.fn<typeof fetch>();
+        const briq = new Briq('key', { fetch: fn, execution: { fetch: execution } });
+        await expect(briq.exec('bq_one', ['true'])).resolves.toEqual(result);
+        expect(calls(fn, '/access')).toBe(1);
+        await vi.advanceTimersByTimeAsync(9 * 60_000);
+        await expect(briq.exec('bq_one', ['true'])).resolves.toEqual(result);
+        expect(calls(fn, '/access')).toBe(1);
+        // Past the cooldown the briq is asked about again.
+        await vi.advanceTimersByTimeAsync(2 * 60_000);
+        await briq.exec('bq_one', ['true']);
+        expect(calls(fn, '/access')).toBe(2);
+        expect(execution).not.toHaveBeenCalled();
+      });
+    });
+
+    it('goes through the API for the briqs past the tracking bound instead of failing', async () => {
+      const waiting: Array<(r: Response) => void> = [];
+      const fn = control(() => new Promise<Response>((resolve) => waiting.push(resolve)));
+      const execution = vi.fn<typeof fetch>().mockImplementation(async () => json(result));
+      const briq = new Briq('key', { fetch: fn, execution: { fetch: execution } });
+      const runs = Array.from({ length: 1030 }, (_, i) => briq.exec(`bq_${i}`, ['true']));
+      await vi.waitFor(() => expect(calls(fn, '/exec')).toBe(6));
+      expect(calls(fn, '/access')).toBe(1024);
+      for (const answer of waiting) answer(error(404, 'no_regional_route'));
+      await expect(Promise.all(runs)).resolves.toHaveLength(1030);
+    });
+
+    it('runs the command through the API when the regional origin cannot be connected to', async () => {
+      const fn = control(() => json(descriptor()));
+      const refusedConnection = Object.assign(new TypeError('fetch failed'), {
+        cause: { code: 'ECONNREFUSED' },
+      });
+      const execution = vi.fn<typeof fetch>().mockRejectedValue(refusedConnection);
+      const briq = new Briq('key', { fetch: fn, execution: { fetch: execution } });
+      await expect(briq.exec('bq_one', ['true'])).resolves.toEqual(result);
+      expect(execution).toHaveBeenCalledTimes(1);
+      expect(calls(fn, '/exec')).toBe(1);
+      // The next commands do not try the unreachable origin again at once.
+      await expect(briq.exec('bq_one', ['true'])).resolves.toEqual(result);
+      expect(execution).toHaveBeenCalledTimes(1);
+      expect(calls(fn, '/exec')).toBe(2);
+    });
+
+    it.each([
+      ['a reset', Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } })],
+      ['an error without a cause', new TypeError('fetch failed')],
+      ['a timeout', new DOMException('The operation timed out', 'TimeoutError')],
+    ])('never repeats a command whose request may have left (%s)', async (_, failure) => {
+      const fn = control(() => json(descriptor()));
+      const execution = vi.fn<typeof fetch>().mockRejectedValue(failure);
+      await expect(
+        new Briq('key', { fetch: fn, execution: { fetch: execution } }).exec('bq_one', ['true']),
+      ).rejects.toMatchObject({ code: 'outcome_unknown' });
+      expect(execution).toHaveBeenCalledTimes(1);
+      expect(calls(fn, '/exec')).toBe(0);
+    });
+  });
 
   it.each([
     { origin: 'http://commands.example' },

@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import type { RunInput } from '@briq-cloud/sdk';
-import type { ExposeMode, FileContent } from '@briq/public';
+import { EgressPolicy, type ExposeMode, type FileContent } from '@briq/public';
 import { usage } from './errors.js';
 
 export const mode = (v: string | undefined): ExposeMode | undefined => {
@@ -64,6 +64,8 @@ export interface RunFlags {
   path?: string;
   token?: string;
   step?: string[];
+  egressHost?: string[];
+  egressDenyAll?: boolean;
   wait: boolean;
 }
 
@@ -76,6 +78,17 @@ export function runInput(target: string, o: RunFlags): RunInput {
   const ports = portsOf(o.port);
   const files = filesOf(o.file);
   const gb = intOf('--volume-gb', o.volumeGb);
+  if (o.egressHost !== undefined && o.egressDenyAll)
+    throw usage('--egress-host and --egress-deny-all cannot be used together');
+  const egressResult =
+    o.egressHost !== undefined
+      ? EgressPolicy.safeParse({ hosts: o.egressHost })
+      : o.egressDenyAll
+        ? EgressPolicy.safeParse({ hosts: [] })
+        : undefined;
+  if (egressResult && !egressResult.success)
+    throw usage(`--egress-host: ${egressResult.error.issues[0]?.message}`);
+  const egress = egressResult?.data;
   const common = {
     ...(o.stack ? { stack: o.stack } : {}),
     ...(expose ? { expose } : {}),
@@ -101,6 +114,7 @@ export function runInput(target: string, o: RunFlags): RunInput {
         ...(o.volume ? { volume: { mount: o.volume, ...(gb ? { gb } : {}) } } : {}),
         ...(o.size ? { size: o.size as 'small' } : {}),
         ...(o.sleep ? { sleep: o.sleep } : {}),
+        ...(egress ? { egress } : {}),
       },
       ...common,
     };
@@ -141,6 +155,7 @@ export function runInput(target: string, o: RunFlags): RunInput {
       : {}),
     ...(o.step?.length ? { steps: o.step.map((run) => ({ run })) } : {}),
     ...(o.sleep ? { sleep: o.sleep } : {}),
+    ...(egress ? { egress } : {}),
     ...common,
   };
 }
